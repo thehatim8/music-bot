@@ -1,0 +1,63 @@
+server:
+  port: 2333
+  address: 0.0.0.0
+  http2:
+    enabled: false
+
+plugins:
+  youtube:
+    enabled: true
+    allowSearch: true
+    allowDirectVideoIds: true
+    allowDirectPlaylistIds: true
+    clients:
+      - MUSIC
+      - ANDROID_VR
+      - WEB
+      - WEBEMBEDDED
+
+    # Optional: if YouTube starts returning "Sign in to confirm you're not a bot"
+    # for WEB or WEBEMBEDDED requests, generate a poToken and visitorData and
+    # uncomment the block below.
+    #
+    # pot:
+    #   token: "paste-your-po-token-here"
+    #   visitorData: "paste-your-visitor-data-here"
+
+    # Optional: OAuth can help when YouTube requires sign-in, but the upstream
+    # plugin warns that it is not a silver bullet and should be used with a burner
+    # account, not your primary Google account.
+    #
+    # oauth:
+    #   enabled: true
+    #   # refreshToken: "paste-your-refresh-token-here"
+    #   # skipInitialization: true
+
+lavalink:
+  plugins:
+    - dependency: "dev.lavalink.youtube:youtube-plugin:1.16.0"
+      snapshot: false
+
+  server:
+    password: "changeme123"
+    sources:
+      youtube: false
+      bandcamp: true
+      soundcloud: true
+      twitch: false
+      vimeo: false
+      nico: false
+      http: true
+      local: false
+
+    filters:
+      volume: true
+      equalizer: true
+      karaoke: true
+      timescale: true
+      tremolo: true
+      vibrato: true
+      distortion: true
+      rotation: true
+      channelMix: true
+      lowPass: true
