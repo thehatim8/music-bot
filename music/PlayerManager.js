@@ -5,6 +5,19 @@ const { createErrorEmbed, createInfoEmbed, createNowPlayingPayload } = require("
 const { shuffleArray } = require("../utils/formatters");
 
 const START_TIMEOUT_NOTICE_THROTTLE_MS = 30000;
+const PLAYBACK_START_POSITION_GRACE_MS = 1000;
+const NEUTRAL_AUDIO_FILTERS = Object.freeze({
+  volume: 1,
+  equalizer: [],
+  karaoke: null,
+  timescale: null,
+  tremolo: null,
+  vibrato: null,
+  rotation: null,
+  distortion: null,
+  channelMix: null,
+  lowPass: null
+});
 
 class PlayerManager {
   constructor(client, config) {
@@ -24,10 +37,11 @@ class PlayerManager {
         moveOnDisconnect: false,
         reconnectTries: 3,
         reconnectInterval: 5,
-        restTimeout: 30,
-        resume: true,
-        resumeByLibrary: true,
-        resumeTimeout: 60
+        restTimeout: 60,
+        resume: false,
+        resumeByLibrary: false,
+        resumeTimeout: 0,
+        voiceConnectionTimeout: 30
       }
     );
 
@@ -112,6 +126,7 @@ class PlayerManager {
       autoplayResolvePromise: null,
       idleTimer: null,
       playbackStartTimer: null,
+      playbackStartRequestedAt: 0,
       lastStartTimeoutNoticeAt: 0
     };
 
@@ -134,6 +149,17 @@ class PlayerManager {
       }
 
       await this.sendNowPlaying(state);
+    });
+
+    player.on("update", () => {
+      if (!state.playbackStartTimer || !state.current) {
+        return;
+      }
+
+      const hasHadTimeToStart = Date.now() - state.playbackStartRequestedAt >= PLAYBACK_START_POSITION_GRACE_MS;
+      if (hasHadTimeToStart && player.track === state.current.encoded && player.position > 0) {
+        this.clearPlaybackStartTimer(state);
+      }
     });
 
     player.on("end", async (event) => {
@@ -182,21 +208,28 @@ class PlayerManager {
     };
   }
 
+  buildNeutralAudioFilters() {
+    return {
+      ...NEUTRAL_AUDIO_FILTERS,
+      equalizer: []
+    };
+  }
+
   async prepareAudioOutput(player) {
+    try {
+      await player.update({
+        volume: DEFAULT_PLAYBACK_VOLUME,
+        filters: this.buildNeutralAudioFilters()
+      });
+      return;
+    } catch (error) {
+      console.warn("Failed to reset Lavalink audio filters:", error);
+    }
+
     try {
       await player.setGlobalVolume(DEFAULT_PLAYBACK_VOLUME);
     } catch (error) {
       console.warn("Failed to set Lavalink playback volume:", error);
-    }
-
-    if (typeof player.clearFilters !== "function") {
-      return;
-    }
-
-    try {
-      await player.clearFilters();
-    } catch (error) {
-      console.warn("Failed to clear Lavalink audio filters:", error);
     }
   }
 
@@ -369,6 +402,8 @@ class PlayerManager {
 
     const track = state.current;
     this.clearPlaybackStartTimer(state);
+    await this.prepareAudioOutput(state.player);
+    state.playbackStartRequestedAt = Date.now();
     state.playbackStartTimer = setTimeout(() => {
       void this.handlePlaybackStartTimeout(state.guildId, track).catch((error) => {
         console.error(`Failed to recover from playback start timeout in guild ${state.guildId}:`, error);
@@ -376,11 +411,11 @@ class PlayerManager {
     }, PLAYBACK_START_TIMEOUT_MS);
 
     try {
-      await this.prepareAudioOutput(state.player);
       await state.player.playTrack({
         track: {
           encoded: track.encoded
-        }
+        },
+        volume: DEFAULT_PLAYBACK_VOLUME
       });
     } catch (error) {
       this.clearPlaybackStartTimer(state);
@@ -394,6 +429,11 @@ class PlayerManager {
     const state = this.getState(guildId);
 
     if (!state || state.current !== track) {
+      return;
+    }
+
+    if (state.player.track === track.encoded && state.player.position > 0) {
+      this.clearPlaybackStartTimer(state);
       return;
     }
 
@@ -576,6 +616,8 @@ class PlayerManager {
       clearTimeout(state.playbackStartTimer);
       state.playbackStartTimer = null;
     }
+
+    state.playbackStartRequestedAt = 0;
   }
 
   scheduleIdleDestroy(state) {
