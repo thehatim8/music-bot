@@ -1,6 +1,6 @@
 const { Connectors, Constants, Shoukaku } = require("shoukaku");
 
-const { IDLE_TIMEOUT_MS, PLAYBACK_START_TIMEOUT_MS } = require("../utils/constants");
+const { DEFAULT_PLAYBACK_VOLUME, IDLE_TIMEOUT_MS, PLAYBACK_START_TIMEOUT_MS } = require("../utils/constants");
 const { createErrorEmbed, createInfoEmbed, createNowPlayingPayload } = require("../utils/embeds");
 const { shuffleArray } = require("../utils/formatters");
 
@@ -93,7 +93,7 @@ class PlayerManager {
       deaf: true
     });
 
-    await player.setGlobalVolume(100);
+    await this.prepareAudioOutput(player);
 
     const state = {
       guildId,
@@ -180,6 +180,24 @@ class PlayerManager {
       requester: { ...track.requester },
       sourceLabel: track.sourceLabel
     };
+  }
+
+  async prepareAudioOutput(player) {
+    try {
+      await player.setGlobalVolume(DEFAULT_PLAYBACK_VOLUME);
+    } catch (error) {
+      console.warn("Failed to set Lavalink playback volume:", error);
+    }
+
+    if (typeof player.clearFilters !== "function") {
+      return;
+    }
+
+    try {
+      await player.clearFilters();
+    } catch (error) {
+      console.warn("Failed to clear Lavalink audio filters:", error);
+    }
   }
 
   enqueueTracks(guildId, tracks) {
@@ -358,6 +376,7 @@ class PlayerManager {
     }, PLAYBACK_START_TIMEOUT_MS);
 
     try {
+      await this.prepareAudioOutput(state.player);
       await state.player.playTrack({
         track: {
           encoded: track.encoded
