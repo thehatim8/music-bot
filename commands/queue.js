@@ -5,6 +5,33 @@ const { createInteractionMessage } = require("../utils/interactionMessage");
 const { MAX_QUEUE_PREVIEW } = require("../utils/constants");
 const { formatDuration, formatTrackLine } = require("../utils/formatters");
 
+const EMBED_FIELD_VALUE_LIMIT = 1024;
+
+function fitFieldValue(value) {
+  if (value.length <= EMBED_FIELD_VALUE_LIMIT) {
+    return value;
+  }
+
+  return `${value.slice(0, EMBED_FIELD_VALUE_LIMIT - 3)}...`;
+}
+
+function buildUpcomingPreview(queue) {
+  const lines = [];
+
+  for (let index = 0; index < queue.length && index < MAX_QUEUE_PREVIEW; index += 1) {
+    const line = formatTrackLine(queue[index], index + 1);
+    const nextValue = lines.length ? `${lines.join("\n")}\n${line}` : line;
+
+    if (nextValue.length > EMBED_FIELD_VALUE_LIMIT) {
+      break;
+    }
+
+    lines.push(line);
+  }
+
+  return lines;
+}
+
 async function runQueue({ client, message }) {
   const state = client.playerManager.getState(message.guild.id);
 
@@ -15,7 +42,7 @@ async function runQueue({ client, message }) {
     return;
   }
 
-  const upcoming = state.queue.slice(0, MAX_QUEUE_PREVIEW).map((track, index) => formatTrackLine(track, index + 1));
+  const upcoming = buildUpcomingPreview(state.queue);
   const remaining = state.queue.length - upcoming.length;
   const totalDuration = [state.current, ...state.queue]
     .filter(Boolean)
@@ -26,13 +53,19 @@ async function runQueue({ client, message }) {
     .addFields(
       {
         name: "Now playing",
-        value: state.current
-          ? formatTrackLine(state.current, 0).replace("`00.`", "`NP`")
-          : "Playback is starting. Use this queue preview to see what is lined up."
+        value: fitFieldValue(
+          state.current
+            ? formatTrackLine(state.current, 0).replace("`00.`", "`NP`")
+            : "Playback is starting. Use this queue preview to see what is lined up."
+        )
       },
       {
         name: "Up next",
-        value: upcoming.length ? upcoming.join("\n") : "No upcoming tracks queued."
+        value: upcoming.length
+          ? upcoming.join("\n")
+          : state.queue.length
+            ? "Upcoming tracks are too long to preview safely."
+            : "No upcoming tracks queued."
       },
       {
         name: "Queue stats",

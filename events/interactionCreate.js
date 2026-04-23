@@ -1,5 +1,5 @@
 const { MessageFlags } = require("discord.js");
-const { createErrorEmbed, createNowPlayingPayload, createPlayerControlsRow } = require("../utils/embeds");
+const { createErrorEmbed, createNowPlayingPayload, createPlayerControlsRow, createSuccessEmbed } = require("../utils/embeds");
 
 function isUnknownInteractionError(error) {
   return error?.code === 10062 || error?.rawError?.code === 10062 || error?.message?.includes("Unknown interaction");
@@ -116,6 +116,42 @@ async function handleMusicControls(client, interaction) {
       await interaction.message.edit({
         components: [createPlayerControlsRow(client.playerManager.getState(interaction.guildId))]
       }).catch(() => null);
+      return;
+    }
+
+    if (action === "autoplay") {
+      const updatedState = client.playerManager.toggleAutoplay(interaction.guildId);
+
+      await interaction.message.edit(createNowPlayingPayload(updatedState.current, updatedState)).catch(() => null);
+
+      if (!updatedState.autoplayEnabled) {
+        await interaction.followUp({
+          embeds: [createSuccessEmbed("Autoplay is now off.", "Autoplay disabled")],
+          flags: MessageFlags.Ephemeral
+        }).catch(() => null);
+        return;
+      }
+
+      try {
+        const queuedTrack = await client.playerManager.ensureAutoplayQueue(interaction.guildId);
+        await interaction.followUp({
+          embeds: [
+            createSuccessEmbed(
+              queuedTrack
+                ? `Autoplay is on. Next similar track: **${queuedTrack.info.title}**.`
+                : "Autoplay is on. Similar songs will be added when the queue runs out.",
+              "Autoplay enabled"
+            )
+          ],
+          flags: MessageFlags.Ephemeral
+        }).catch(() => null);
+      } catch (error) {
+        await interaction.followUp({
+          embeds: [createErrorEmbed(error.message || "I could not find a similar song for autoplay.")],
+          flags: MessageFlags.Ephemeral
+        }).catch(() => null);
+      }
+
       return;
     }
 

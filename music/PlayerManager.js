@@ -1,8 +1,10 @@
 const { Connectors, Constants, Shoukaku } = require("shoukaku");
 
-const { IDLE_TIMEOUT_MS } = require("../utils/constants");
+const { IDLE_TIMEOUT_MS, PLAYBACK_START_TIMEOUT_MS } = require("../utils/constants");
 const { createErrorEmbed, createInfoEmbed, createNowPlayingPayload } = require("../utils/embeds");
 const { shuffleArray } = require("../utils/formatters");
+
+const START_TIMEOUT_NOTICE_THROTTLE_MS = 30000;
 
 class PlayerManager {
   constructor(client, config) {
@@ -56,14 +58,32 @@ class PlayerManager {
     return this.states.get(guildId) || null;
   }
 
+  isStateUsable(guildId, state) {
+    if (!this.shoukaku.connections.has(guildId) || !this.shoukaku.players.has(guildId)) {
+      return false;
+    }
+
+    const botMember = this.client.guilds.cache.get(guildId)?.members.me;
+
+    if (!botMember) {
+      return true;
+    }
+
+    return botMember.voice.channelId === state.voiceChannelId;
+  }
+
   async createOrGetState({ guildId, voiceChannelId, textChannelId, shardId }) {
     const existing = this.getState(guildId);
 
     if (existing) {
-      existing.textChannelId = textChannelId;
-      existing.voiceChannelId = voiceChannelId;
-      this.clearIdleTimer(existing);
-      return existing;
+      if (!this.isStateUsable(guildId, existing)) {
+        await this.destroy(guildId);
+      } else {
+        existing.textChannelId = textChannelId;
+        existing.voiceChannelId = voiceChannelId;
+        this.clearIdleTimer(existing);
+        return existing;
+      }
     }
 
     const player = await this.shoukaku.joinVoiceChannel({
@@ -87,7 +107,12 @@ class PlayerManager {
       isPaused: false,
       skipLoopOnce: false,
       suppressNextStartMessage: false,
-      idleTimer: null
+      isDestroying: false,
+      autoplayEnabled: false,
+      autoplayResolvePromise: null,
+      idleTimer: null,
+      playbackStartTimer: null,
+      lastStartTimeoutNoticeAt: 0
     };
 
     this.bindPlayerEvents(state);
@@ -99,6 +124,7 @@ class PlayerManager {
     const { player } = state;
 
     player.on("start", async () => {
+      this.clearPlaybackStartTimer(state);
       this.clearIdleTimer(state);
       state.isPaused = false;
 
@@ -115,29 +141,33 @@ class PlayerManager {
         return;
       }
 
-      await this.advanceQueue(state.guildId);
+      this.clearPlaybackStartTimer(state);
+      await this.advanceQueue(state.guildId).catch((error) => this.handleAdvanceError(state, error));
     });
 
     player.on("stuck", async () => {
+      this.clearPlaybackStartTimer(state);
       state.skipLoopOnce = true;
       await this.sendToTextChannel(
         state.textChannelId,
         { embeds: [createErrorEmbed("The current track got stuck, so I skipped to the next item in queue.", "Playback issue")] }
       );
-      await this.advanceQueue(state.guildId);
+      await this.advanceQueue(state.guildId).catch((error) => this.handleAdvanceError(state, error));
     });
 
     player.on("exception", async (event) => {
+      this.clearPlaybackStartTimer(state);
       console.error(`Playback exception in guild ${state.guildId}:`, event.exception);
       state.skipLoopOnce = true;
       await this.sendToTextChannel(
         state.textChannelId,
         { embeds: [createErrorEmbed("Lavalink reported a playback exception. I tried to keep the queue moving.", "Playback issue")] }
       );
-      await this.advanceQueue(state.guildId);
+      await this.advanceQueue(state.guildId).catch((error) => this.handleAdvanceError(state, error));
     });
 
     player.on("closed", async () => {
+      this.clearPlaybackStartTimer(state);
       await this.destroy(state.guildId, "The voice connection closed, so I cleaned up the player.");
     });
   }
@@ -164,6 +194,84 @@ class PlayerManager {
     return state;
   }
 
+  setAutoplay(guildId, enabled) {
+    const state = this.getState(guildId);
+
+    if (!state) {
+      throw new Error("There is no active player.");
+    }
+
+    state.autoplayEnabled = Boolean(enabled);
+    return state;
+  }
+
+  toggleAutoplay(guildId) {
+    const state = this.getState(guildId);
+
+    if (!state) {
+      throw new Error("There is no active player.");
+    }
+
+    return this.setAutoplay(guildId, !state.autoplayEnabled);
+  }
+
+  getAutoplayExclusions(state, referenceTrack) {
+    return [
+      referenceTrack,
+      state.current,
+      ...state.queue,
+      ...state.history.slice(-25)
+    ].filter(Boolean);
+  }
+
+  async resolveAndQueueAutoplayTrack(state, sourceTrack) {
+    const requester = sourceTrack?.requester;
+
+    if (!requester?.id) {
+      throw new Error("Autoplay needs a valid requester from the current track.");
+    }
+
+    const exclusions = this.getAutoplayExclusions(state, sourceTrack);
+    const track = await this.client.music.resolveAutoplayTrack(sourceTrack, requester, exclusions);
+
+    if (!state.autoplayEnabled || state.queue.length > 0) {
+      return null;
+    }
+
+    state.queue.push(track);
+    this.clearIdleTimer(state);
+    return track;
+  }
+
+  async ensureAutoplayQueue(guildId, referenceTrack) {
+    const state = this.getState(guildId);
+
+    if (!state || !state.autoplayEnabled || state.queue.length > 0) {
+      return null;
+    }
+
+    const sourceTrack = referenceTrack || state.current || state.history[state.history.length - 1];
+
+    if (!sourceTrack) {
+      return null;
+    }
+
+    if (state.autoplayResolvePromise) {
+      return state.autoplayResolvePromise;
+    }
+
+    const resolvePromise = this.resolveAndQueueAutoplayTrack(state, sourceTrack);
+    state.autoplayResolvePromise = resolvePromise;
+
+    try {
+      return await resolvePromise;
+    } finally {
+      if (state.autoplayResolvePromise === resolvePromise) {
+        state.autoplayResolvePromise = null;
+      }
+    }
+  }
+
   async playIfIdle(guildId) {
     const state = this.getState(guildId);
 
@@ -171,8 +279,13 @@ class PlayerManager {
       throw new Error("No player exists for this guild yet.");
     }
 
-    if (state.current || state.player.track) {
+    if (state.current && state.player.track) {
       return false;
+    }
+
+    if (state.current && !state.player.track) {
+      await this.playCurrentTrack(state);
+      return true;
     }
 
     await this.advanceQueue(guildId);
@@ -203,7 +316,14 @@ class PlayerManager {
 
     state.skipLoopOnce = false;
 
-    const nextTrack = state.queue.shift();
+    const autoplaySource = state.current;
+    let nextTrack = state.queue.shift();
+
+    if (!nextTrack && state.autoplayEnabled) {
+      await this.ensureAutoplayQueue(guildId, autoplaySource).catch((error) => this.handleAdvanceError(state, error));
+      nextTrack = state.queue.shift();
+    }
+
     state.current = nextTrack || null;
     state.isPaused = false;
 
@@ -212,11 +332,76 @@ class PlayerManager {
       return;
     }
 
-    await state.player.playTrack({
-      track: {
-        encoded: nextTrack.encoded
+    try {
+      await this.playCurrentTrack(state);
+    } catch (error) {
+      if (state.current === nextTrack) {
+        state.current = null;
+        state.queue.unshift(nextTrack);
       }
-    });
+
+      throw error;
+    }
+  }
+
+  async playCurrentTrack(state) {
+    if (!state.current) {
+      return false;
+    }
+
+    const track = state.current;
+    this.clearPlaybackStartTimer(state);
+    state.playbackStartTimer = setTimeout(() => {
+      void this.handlePlaybackStartTimeout(state.guildId, track).catch((error) => {
+        console.error(`Failed to recover from playback start timeout in guild ${state.guildId}:`, error);
+      });
+    }, PLAYBACK_START_TIMEOUT_MS);
+
+    try {
+      await state.player.playTrack({
+        track: {
+          encoded: track.encoded
+        }
+      });
+    } catch (error) {
+      this.clearPlaybackStartTimer(state);
+      throw error;
+    }
+
+    return true;
+  }
+
+  async handlePlaybackStartTimeout(guildId, track) {
+    const state = this.getState(guildId);
+
+    if (!state || state.current !== track) {
+      return;
+    }
+
+    console.warn(`Playback did not start within ${PLAYBACK_START_TIMEOUT_MS}ms in guild ${guildId}; skipping ${track.info?.title || "unknown track"}.`);
+    this.clearPlaybackStartTimer(state);
+    state.skipLoopOnce = true;
+    state.current = null;
+    state.isPaused = false;
+
+    const now = Date.now();
+    if (now - state.lastStartTimeoutNoticeAt >= START_TIMEOUT_NOTICE_THROTTLE_MS) {
+      state.lastStartTimeoutNoticeAt = now;
+      await this.sendToTextChannel(
+        state.textChannelId,
+        { embeds: [createErrorEmbed("Playback did not start in time, so I skipped to the next queued track.", "Playback issue")] }
+      );
+    }
+
+    await this.advanceQueue(guildId).catch((error) => this.handleAdvanceError(state, error));
+  }
+
+  async handleAdvanceError(state, error) {
+    console.error(`Failed to advance queue in guild ${state.guildId}:`, error);
+    await this.sendToTextChannel(
+      state.textChannelId,
+      { embeds: [createErrorEmbed(error.message || "I could not start the next track.", "Playback issue")] }
+    );
   }
 
   async pause(guildId) {
@@ -248,6 +433,7 @@ class PlayerManager {
       throw new Error("There is no active track to skip.");
     }
 
+    this.clearPlaybackStartTimer(state);
     state.skipLoopOnce = true;
     await state.player.stopTrack();
     return state;
@@ -260,6 +446,7 @@ class PlayerManager {
       throw new Error("There is no active player to stop.");
     }
 
+    this.clearPlaybackStartTimer(state);
     state.queue.length = 0;
     state.current = null;
     await this.destroy(guildId);
@@ -331,11 +518,7 @@ class PlayerManager {
     state.skipLoopOnce = true;
     state.current = previousTrack;
     state.isPaused = false;
-    await state.player.playTrack({
-      track: {
-        encoded: previousTrack.encoded
-      }
-    });
+    await this.playCurrentTrack(state);
 
     return {
       state,
@@ -369,8 +552,16 @@ class PlayerManager {
     }
   }
 
+  clearPlaybackStartTimer(state) {
+    if (state.playbackStartTimer) {
+      clearTimeout(state.playbackStartTimer);
+      state.playbackStartTimer = null;
+    }
+  }
+
   scheduleIdleDestroy(state) {
     this.clearIdleTimer(state);
+    this.clearPlaybackStartTimer(state);
 
     state.idleTimer = setTimeout(async () => {
       const latestState = this.getState(state.guildId);
@@ -395,6 +586,8 @@ class PlayerManager {
     }
 
     this.clearIdleTimer(state);
+    this.clearPlaybackStartTimer(state);
+    state.isDestroying = true;
 
     try {
       await this.shoukaku.leaveVoiceChannel(guildId);

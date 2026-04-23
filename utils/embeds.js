@@ -72,13 +72,20 @@ function createPlayerControlsRow(state) {
       .setCustomId("music:stop")
       .setLabel("Stop")
       .setStyle(ButtonStyle.Danger)
+      .setDisabled(!state?.current),
+    new ButtonBuilder()
+      .setCustomId("music:autoplay")
+      .setLabel(state?.autoplayEnabled ? "Autoplay On" : "Autoplay")
+      .setStyle(state?.autoplayEnabled ? ButtonStyle.Success : ButtonStyle.Secondary)
       .setDisabled(!state?.current)
   );
 }
 
 function createNowPlayingPayload(track, state) {
+  const footer = `Loop: ${state.loopMode} | Autoplay: ${state.autoplayEnabled ? "On" : "Off"}`;
+
   return {
-    embeds: [createTrackEmbed(track, "Now playing", `Loop: ${state.loopMode}`)],
+    embeds: [createTrackEmbed(track, "Now playing", footer)],
     components: [createPlayerControlsRow(state)]
   };
 }

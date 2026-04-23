@@ -65,6 +65,83 @@ class MusicService {
     }
   }
 
+  cleanAutoplayTitle(title) {
+    return String(title || "")
+      .replace(/\[[^\]]*(official|lyrics?|video|audio|visualizer|hd|4k)[^\]]*\]/gi, " ")
+      .replace(/\([^)]*(official|lyrics?|video|audio|visualizer|hd|4k)[^)]*\)/gi, " ")
+      .replace(/\b(official\s*)?(music\s*)?(video|audio|lyrics?|visualizer)\b/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  getTrackKeys(track) {
+    const info = track?.info || {};
+    return [info.identifier, info.uri, `${info.author || ""}:${info.title || ""}`]
+      .filter(Boolean)
+      .map((value) => String(value).toLowerCase());
+  }
+
+  buildExcludedTrackKeys(tracks) {
+    return new Set(tracks.flatMap((track) => this.getTrackKeys(track)));
+  }
+
+  isExcludedTrack(rawTrack, excludedKeys) {
+    return this.getTrackKeys(rawTrack).some((key) => excludedKeys.has(key));
+  }
+
+  buildAutoplaySearchQueries(track) {
+    const title = this.cleanAutoplayTitle(track?.info?.title);
+    const author = this.cleanAutoplayTitle(track?.info?.author);
+    const queries = [];
+
+    if (author && title) {
+      queries.push(`${author} ${title} similar songs`);
+      queries.push(`${author} ${title} mix`);
+      queries.push(`${author} songs`);
+    }
+
+    if (title) {
+      queries.push(`${title} similar songs`);
+      queries.push(`${title} mix`);
+    }
+
+    return [...new Set(queries.filter(Boolean))];
+  }
+
+  getLavalinkTracks(result) {
+    if (!result || result.loadType === "empty" || result.loadType === "error") {
+      return [];
+    }
+
+    if (Array.isArray(result.data)) {
+      return result.data;
+    }
+
+    if (Array.isArray(result.data?.tracks)) {
+      return result.data.tracks;
+    }
+
+    return result.data ? [result.data] : [];
+  }
+
+  async resolveAutoplayTrack(referenceTrack, requester, excludedTracks = []) {
+    const node = this.client.playerManager.getSearchNode();
+    const excludedKeys = this.buildExcludedTrackKeys([referenceTrack, ...excludedTracks].filter(Boolean));
+    const queries = this.buildAutoplaySearchQueries(referenceTrack);
+
+    for (const query of queries) {
+      const result = await node.rest.resolve(`ytsearch:${query}`).catch(() => null);
+      const candidates = this.getLavalinkTracks(result);
+      const match = candidates.find((track) => !this.isExcludedTrack(track, excludedKeys));
+
+      if (match) {
+        return this.createQueueTrack(match, requester, "Autoplay");
+      }
+    }
+
+    throw new Error("I could not find a similar song for autoplay.");
+  }
+
   async resolveSpotifyTrack(url, requester) {
     const track = await this.spotify.getTrack(url);
     const resolved = await this.resolveLavalink(track.searchQuery, requester, { allowPlaylists: false, sourceLabel: "Spotify" });

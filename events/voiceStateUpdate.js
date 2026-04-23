@@ -7,6 +7,18 @@ module.exports = {
       return;
     }
 
+    if (state.isDestroying) {
+      return;
+    }
+
+    if (oldState.id === client.user.id && oldState.channelId === state.voiceChannelId && newState.channelId !== state.voiceChannelId) {
+      await client.playerManager.destroy(
+        oldState.guild.id,
+        "I was disconnected from the voice channel, so I cleaned up the player."
+      );
+      return;
+    }
+
     if (oldState.channelId !== state.voiceChannelId && newState.channelId !== state.voiceChannelId) {
       return;
     }
