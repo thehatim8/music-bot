@@ -271,7 +271,7 @@ class PlayerManager {
       referenceTrack,
       state.current,
       ...state.queue,
-      ...state.history.slice(-25)
+      ...state.history.slice(-20)
     ].filter(Boolean);
   }
 
@@ -352,7 +352,7 @@ class PlayerManager {
 
     if (state.current) {
       state.history.push(this.buildLoopTrack(state.current));
-      if (state.history.length > 25) {
+      if (state.history.length > 20) {
         state.history.shift();
       }
     }

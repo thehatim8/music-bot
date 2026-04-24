@@ -39,8 +39,8 @@ module.exports = {
   },
   spotify: {
     clientId: requireEnv("SPOTIFY_CLIENT_ID"),
-    clientSecret: requireEnv("SPOTIFY_CLIENT_SECRET")
+    clientSecret: requireEnv("SPOTIFY_CLIENT_SECRET"),
+    market: process.env.SPOTIFY_MARKET?.trim() || "US"
   },
   defaultPrefix: process.env.DEFAULT_PREFIX?.trim() || DEFAULT_PREFIX
 };
-

@@ -1,4 +1,5 @@
 const SpotifyService = require("./SpotifyService");
+const AutoplayService = require("./AutoplayService");
 const { SPOTIFY_RESOLVE_CONCURRENCY } = require("../utils/constants");
 const { mapWithConcurrency } = require("../utils/async");
 
@@ -6,6 +7,7 @@ class MusicService {
   constructor(client) {
     this.client = client;
     this.spotify = new SpotifyService(client.config);
+    this.autoplay = new AutoplayService(this);
   }
 
   isUrl(input) {
@@ -65,47 +67,11 @@ class MusicService {
     }
   }
 
-  cleanAutoplayTitle(title) {
-    return String(title || "")
-      .replace(/\[[^\]]*(official|lyrics?|video|audio|visualizer|hd|4k)[^\]]*\]/gi, " ")
-      .replace(/\([^)]*(official|lyrics?|video|audio|visualizer|hd|4k)[^)]*\)/gi, " ")
-      .replace(/\b(official\s*)?(music\s*)?(video|audio|lyrics?|visualizer)\b/gi, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-  }
-
   getTrackKeys(track) {
     const info = track?.info || {};
     return [info.identifier, info.uri, `${info.author || ""}:${info.title || ""}`]
       .filter(Boolean)
       .map((value) => String(value).toLowerCase());
-  }
-
-  buildExcludedTrackKeys(tracks) {
-    return new Set(tracks.flatMap((track) => this.getTrackKeys(track)));
-  }
-
-  isExcludedTrack(rawTrack, excludedKeys) {
-    return this.getTrackKeys(rawTrack).some((key) => excludedKeys.has(key));
-  }
-
-  buildAutoplaySearchQueries(track) {
-    const title = this.cleanAutoplayTitle(track?.info?.title);
-    const author = this.cleanAutoplayTitle(track?.info?.author);
-    const queries = [];
-
-    if (author && title) {
-      queries.push(`${author} ${title} similar songs`);
-      queries.push(`${author} ${title} mix`);
-      queries.push(`${author} songs`);
-    }
-
-    if (title) {
-      queries.push(`${title} similar songs`);
-      queries.push(`${title} mix`);
-    }
-
-    return [...new Set(queries.filter(Boolean))];
   }
 
   getLavalinkTracks(result) {
@@ -125,80 +91,7 @@ class MusicService {
   }
 
   async resolveAutoplayTrack(referenceTrack, requester, excludedTracks = []) {
-    const node = this.client.playerManager.getSearchNode();
-    const blockedTitleTerms = ["lyrics", "lyric", "slowed", "reverb", "8d", "sped up", "cover", "remix", "mix"];
-    const normalize = (value) =>
-      String(value || "")
-        .toLowerCase()
-        .replace(/[^a-z0-9\s]/g, " ")
-        .replace(/\s+/g, " ")
-        .trim();
-    const similarity = (leftValue, rightValue) => {
-      const left = normalize(leftValue);
-      const right = normalize(rightValue);
-
-      if (!left || !right) {
-        return 0;
-      }
-
-      if (left.includes(right) || right.includes(left)) {
-        return 1;
-      }
-
-      const costs = Array.from({ length: right.length + 1 }, (_, index) => index);
-
-      for (let i = 1; i <= left.length; i += 1) {
-        let previous = costs[0];
-        costs[0] = i;
-
-        for (let j = 1; j <= right.length; j += 1) {
-          const current = costs[j];
-          costs[j] = left[i - 1] === right[j - 1] ? previous : Math.min(previous, costs[j], costs[j - 1]) + 1;
-          previous = current;
-        }
-      }
-
-      return 1 - costs[right.length] / Math.max(left.length, right.length);
-    };
-    const getIdentifiers = (track) =>
-      [track?.info?.identifier, track?.raw?.info?.identifier, track?.encoded]
-        .filter(Boolean)
-        .map((value) => String(value).toLowerCase());
-    const recentTracks = [referenceTrack, ...excludedTracks.slice(-20)].filter(Boolean);
-    const excludedIdentifiers = new Set(recentTracks.flatMap(getIdentifiers));
-    const seedTitle = this.cleanAutoplayTitle(referenceTrack?.info?.title);
-    const seedAuthor = this.cleanAutoplayTitle(referenceTrack?.info?.author);
-    const seedTitleNormalized = normalize(seedTitle);
-    const queries = [
-      [seedTitle, seedAuthor, "official audio"].filter(Boolean).join(" "),
-      seedAuthor
-    ].filter(Boolean);
-    const isValidCandidate = (track) => {
-      const title = track?.info?.title || "";
-      const normalizedTitle = normalize(title);
-
-      if (!track?.encoded || getIdentifiers(track).some((identifier) => excludedIdentifiers.has(identifier))) {
-        return false;
-      }
-
-      if (blockedTitleTerms.some((term) => normalizedTitle.includes(term))) {
-        return false;
-      }
-
-      return similarity(seedTitleNormalized, normalizedTitle) <= 0.8;
-    };
-
-    for (const query of queries) {
-      const result = await node.rest.resolve(`ytsearch:${query}`).catch(() => null);
-      const candidates = this.getLavalinkTracks(result).slice(0, 10).filter(isValidCandidate);
-
-      if (candidates.length > 0) {
-        const selected = candidates[Math.floor(Math.random() * candidates.length)];
-        return this.createQueueTrack(selected, requester, "Autoplay");
-      }
-    }
-
-    throw new Error("I could not find a similar song for autoplay.");
+    return this.autoplay.resolve(referenceTrack, requester, excludedTracks);
   }
 
   async resolveSpotifyTrack(url, requester) {
