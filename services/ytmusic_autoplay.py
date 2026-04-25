@@ -173,7 +173,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     host = os.getenv("YTMUSIC_AUTOPLAY_HOST", "127.0.0.1")
-    port = int(os.getenv("YTMUSIC_AUTOPLAY_PORT", "8765"))
+    port = int(os.getenv("YTMUSIC_AUTOPLAY_PORT", "3001"))
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"ytmusic autoplay service listening on http://{host}:{port}", flush=True)
     server.serve_forever()

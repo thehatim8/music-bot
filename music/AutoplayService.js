@@ -1,5 +1,5 @@
-const DEFAULT_YTMUSIC_AUTOPLAY_URL = "http://127.0.0.1:8765";
-const REQUEST_TIMEOUT_MS = 3500;
+const DEFAULT_YTMUSIC_AUTOPLAY_URL = "http://127.0.0.1:3001";
+const REQUEST_TIMEOUT_MS = 3000;
 const DIRECT_RESOLVE_LIMIT = 10;
 const FALLBACK_SEARCH_LIMIT = 8;
 
@@ -9,7 +9,7 @@ class AutoplayService {
   constructor(musicService) {
     this.music = musicService;
     this.client = musicService.client;
-    this.serviceUrl = this.client.config.ytmusicAutoplay?.url || DEFAULT_YTMUSIC_AUTOPLAY_URL;
+    this.serviceUrl = this.normalizeServiceUrl(this.client.config.ytmusicAutoplay?.url || DEFAULT_YTMUSIC_AUTOPLAY_URL);
   }
 
   async resolve(referenceTrack, requester, excludedTracks = []) {
@@ -69,26 +69,40 @@ class AutoplayService {
     const url = new URL("/related", this.serviceUrl);
     url.searchParams.set("videoId", videoId);
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    let lastError = null;
 
-    try {
-      const response = await fetch(url, {
-        signal: controller.signal,
-        headers: {
-          Accept: "application/json"
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+      try {
+        const response = await fetch(url, {
+          signal: controller.signal,
+          headers: {
+            Accept: "application/json"
+          }
+        });
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
         }
-      });
 
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
+        const payload = await response.json();
+        console.log("YTMusic fetch success");
+        return Array.isArray(payload.tracks) ? payload.tracks : [];
+      } catch (error) {
+        lastError = error;
+        console.warn(`YTMusic fetch failed: ${error.message}`);
+      } finally {
+        clearTimeout(timeout);
       }
-
-      const payload = await response.json();
-      return Array.isArray(payload.tracks) ? payload.tracks : [];
-    } finally {
-      clearTimeout(timeout);
     }
+
+    throw lastError || new Error("YTMusic fetch failed");
+  }
+
+  normalizeServiceUrl(value) {
+    return String(value || DEFAULT_YTMUSIC_AUTOPLAY_URL).replace("://localhost", "://127.0.0.1");
   }
 
   filterCandidates(candidates, context) {
