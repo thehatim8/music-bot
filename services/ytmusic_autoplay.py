@@ -9,6 +9,7 @@ from ytmusicapi import YTMusic
 WATCH_LIMIT = 25
 MAX_RESULTS = 15
 MIN_RESULTS_BEFORE_FALLBACK = 10
+SEARCH_LIMIT = 10
 
 ytmusic = YTMusic()
 
@@ -142,9 +143,29 @@ def get_recommendations(video_id):
     return output[:MAX_RESULTS]
 
 
+def get_search_results(query):
+    results = ytmusic.search(query, filter="songs", limit=SEARCH_LIMIT)
+    output = []
+    seen = set()
+    add_tracks(output, seen, results)
+    return output[:SEARCH_LIMIT]
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/search":
+            query = parse_qs(parsed.query).get("q", [""])[0].strip()
+            if not query:
+                self.send_json(400, {"error": "q is required"})
+                return
+
+            try:
+                self.send_json(200, {"tracks": get_search_results(query)})
+            except Exception as error:
+                self.send_json(500, {"error": str(error) or "ytmusicapi search failed"})
+            return
+
         if parsed.path != "/related":
             self.send_json(404, {"error": "not found"})
             return

@@ -54,6 +54,22 @@ class MusicService {
       return this.resolveSpotifyPlaylist(query, requester);
     }
 
+    if (!this.isUrl(query)) {
+      const ytmusicTrack = await this.autoplay.resolveYouTubeMusicSearch(query, requester).catch((error) => {
+        console.warn(`YouTube Music search resolver failed: ${error.message}`);
+        return null;
+      });
+
+      if (ytmusicTrack) {
+        return {
+          type: "track",
+          source: "ytmusic",
+          title: ytmusicTrack.info.title,
+          tracks: [ytmusicTrack]
+        };
+      }
+    }
+
     return this.resolveLavalink(query, requester, { allowPlaylists, sourceLabel: options.sourceLabel });
   }
 

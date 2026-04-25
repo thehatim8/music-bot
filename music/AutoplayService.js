@@ -92,7 +92,16 @@ class AutoplayService {
   async fetchYouTubeMusicCandidates(videoId) {
     const url = new URL("/related", this.serviceUrl);
     url.searchParams.set("videoId", videoId);
+    return this.fetchYouTubeMusicTracks(url);
+  }
 
+  async searchYouTubeMusicTracks(query) {
+    const url = new URL("/search", this.serviceUrl);
+    url.searchParams.set("q", query);
+    return this.fetchYouTubeMusicTracks(url);
+  }
+
+  async fetchYouTubeMusicTracks(url) {
     let lastError = null;
 
     for (let attempt = 1; attempt <= 2; attempt += 1) {
@@ -125,8 +134,46 @@ class AutoplayService {
     throw lastError || new Error("YTMusic fetch failed");
   }
 
+  async resolveYouTubeMusicSearch(query, requester) {
+    const context = this.buildSearchContext(query);
+    const candidates = await this.searchYouTubeMusicTracks(query).catch((error) => {
+      console.warn(`YouTube Music search failed: ${error.message}`);
+      return [];
+    });
+    const filteredCandidates = this.filterCandidates(candidates, context).slice(0, DIRECT_RESOLVE_LIMIT);
+
+    for (const candidate of this.randomTopCandidateOrder(filteredCandidates)) {
+      const track = await this.resolveDirectVideo(candidate, requester, context).catch(() => null);
+
+      if (track) {
+        return track;
+      }
+    }
+
+    return null;
+  }
+
   normalizeServiceUrl(value) {
     return String(value || DEFAULT_YTMUSIC_AUTOPLAY_URL).replace("://localhost", "://127.0.0.1");
+  }
+
+  buildSearchContext(query) {
+    return {
+      referenceTrack: {
+        info: {
+          title: query,
+          author: ""
+        }
+      },
+      videoIds: new Set(),
+      fingerprints: new Set(),
+      recentVideoIds: new Set(),
+      referenceFingerprint: null,
+      referenceTitle: this.normalizeTitle(query),
+      referenceArtist: "",
+      referenceScript: this.detectScriptBucket(query),
+      allowSameSong: true
+    };
   }
 
   filterCandidates(candidates, context) {
@@ -197,7 +244,7 @@ class AutoplayService {
       return false;
     }
 
-    return !this.isSameSongVariant(candidate, context);
+    return context.allowSameSong || !this.isSameSongVariant(candidate, context);
   }
 
   async resolveDirectVideo(candidate, requester, context) {
@@ -350,7 +397,7 @@ class AutoplayService {
       return false;
     }
 
-    return !this.isSameSongVariant(candidate, context);
+    return context.allowSameSong || !this.isSameSongVariant(candidate, context);
   }
 
   async resolveSpotifyCandidate(candidate, requester, context) {
