@@ -42,5 +42,8 @@ module.exports = {
     clientSecret: requireEnv("SPOTIFY_CLIENT_SECRET"),
     market: process.env.SPOTIFY_MARKET?.trim() || "PK"
   },
+  ytmusicAutoplay: {
+    url: process.env.YTMUSIC_AUTOPLAY_URL?.trim() || "http://127.0.0.1:8765"
+  },
   defaultPrefix: process.env.DEFAULT_PREFIX?.trim() || DEFAULT_PREFIX
 };
