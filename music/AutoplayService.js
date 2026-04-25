@@ -2,13 +2,28 @@ const DEFAULT_YTMUSIC_AUTOPLAY_URL = "http://127.0.0.1:3001";
 const REQUEST_TIMEOUT_MS = 3000;
 const DIRECT_RESOLVE_LIMIT = 10;
 const FALLBACK_SEARCH_LIMIT = 8;
+const SPOTIFY_FALLBACK_LIMIT = 10;
 
-const BLOCKED_TITLE_PATTERN = /\b(lyrics?|slowed|reverb|8d|sped\s*up|cover|remix|mix)\b/i;
+const BANNED_WORDS = [
+  "live",
+  "performance",
+  "cover",
+  "remix",
+  "slowed",
+  "reverb",
+  "8d",
+  "sped up",
+  "karaoke",
+  "edit",
+  "version"
+];
 
 class AutoplayService {
   constructor(musicService) {
     this.music = musicService;
     this.client = musicService.client;
+    this.spotify = musicService.spotify;
+    this.market = this.client.config.spotify?.market || "PK";
     this.serviceUrl = this.normalizeServiceUrl(this.client.config.ytmusicAutoplay?.url || DEFAULT_YTMUSIC_AUTOPLAY_URL);
   }
 
@@ -21,15 +36,24 @@ class AutoplayService {
         console.warn(`YouTube Music autoplay service failed: ${error.message}`);
         return [];
       });
-      const orderedCandidates = this.weightedCandidateOrder(this.filterCandidates(candidates, context).slice(0, DIRECT_RESOLVE_LIMIT));
+      const filteredCandidates = this.filterCandidates(candidates, context).slice(0, DIRECT_RESOLVE_LIMIT);
 
-      for (const candidate of orderedCandidates) {
+      for (const candidate of this.randomTopCandidateOrder(filteredCandidates)) {
         const track = await this.resolveDirectVideo(candidate, requester, context).catch(() => null);
 
         if (track) {
           return track;
         }
       }
+    }
+
+    const spotifyTrack = await this.resolveSpotifyFallback(referenceTrack, requester, context).catch((error) => {
+      console.warn(`Spotify autoplay fallback failed: ${error.message}`);
+      return null;
+    });
+
+    if (spotifyTrack) {
+      return spotifyTrack;
     }
 
     return this.resolveYouTubeSearchFallback(referenceTrack, requester, context);
@@ -169,6 +193,10 @@ class AutoplayService {
       return false;
     }
 
+    if (this.isAsciiText(context.referenceTrack?.info?.title) && !this.isAsciiText(candidate.title)) {
+      return false;
+    }
+
     return !this.isSameSongVariant(candidate, context);
   }
 
@@ -205,33 +233,160 @@ class AutoplayService {
     }) || null;
   }
 
-  weightedCandidateOrder(candidates) {
-    const pool = candidates.map((candidate, index) => ({
-      candidate: {
-        ...candidate,
-        rank: index + 1
-      },
-      weight: Math.max(1, candidates.length - index)
+  randomTopCandidateOrder(candidates) {
+    const ranked = candidates.map((candidate, index) => ({
+      ...candidate,
+      rank: index + 1
     }));
-    const ordered = [];
+    const pool = ranked.slice(0, 5);
 
-    while (pool.length > 0) {
-      const totalWeight = pool.reduce((sum, item) => sum + item.weight, 0);
-      let cursor = Math.random() * totalWeight;
-      let selectedIndex = 0;
-
-      for (let index = 0; index < pool.length; index += 1) {
-        cursor -= pool[index].weight;
-        if (cursor <= 0) {
-          selectedIndex = index;
-          break;
-        }
-      }
-
-      ordered.push(pool.splice(selectedIndex, 1)[0].candidate);
+    if (pool.length === 0) {
+      return [];
     }
 
-    return ordered;
+    const selectedIndex = Math.floor(Math.random() * pool.length);
+    const selected = pool[selectedIndex];
+
+    return [
+      selected,
+      ...pool.filter((_, index) => index !== selectedIndex),
+      ...ranked.slice(5)
+    ];
+  }
+
+  async resolveSpotifyFallback(referenceTrack, requester, context) {
+    const seed = await this.findSpotifySeed(referenceTrack);
+    if (!seed) {
+      return null;
+    }
+
+    const candidates = await this.getSpotifyFallbackCandidates(seed);
+    const filtered = candidates
+      .map((track) => this.normalizeSpotifyCandidate(track))
+      .filter(Boolean)
+      .filter((candidate) => this.isAllowedSpotifyCandidate(candidate, context))
+      .slice(0, SPOTIFY_FALLBACK_LIMIT);
+
+    for (const candidate of this.randomTopCandidateOrder(filtered)) {
+      const track = await this.resolveSpotifyCandidate(candidate, requester, context).catch(() => null);
+
+      if (track) {
+        return track;
+      }
+    }
+
+    return null;
+  }
+
+  async findSpotifySeed(referenceTrack) {
+    const query = [this.cleanArtist(referenceTrack?.info?.author), this.cleanTitle(referenceTrack?.info?.title)].filter(Boolean).join(" ");
+    if (!query) {
+      return null;
+    }
+
+    const params = new URLSearchParams({
+      q: query,
+      type: "track",
+      limit: "5",
+      market: this.market
+    });
+    const result = await this.spotify.request(`/search?${params.toString()}`);
+    return result?.tracks?.items?.[0] || null;
+  }
+
+  async getSpotifyFallbackCandidates(seed) {
+    const tracks = [];
+
+    try {
+      const params = new URLSearchParams({
+        limit: String(SPOTIFY_FALLBACK_LIMIT),
+        market: this.market,
+        seed_tracks: seed.id
+      });
+      const result = await this.spotify.request(`/recommendations?${params.toString()}`);
+      tracks.push(...(result?.tracks || []));
+    } catch {
+      // Fall back to artist top tracks below.
+    }
+
+    if (tracks.length === 0 && seed.artists?.[0]?.id) {
+      const result = await this.spotify.request(`/artists/${encodeURIComponent(seed.artists[0].id)}/top-tracks?market=${encodeURIComponent(this.market)}`);
+      tracks.push(...(result?.tracks || []));
+    }
+
+    return tracks;
+  }
+
+  normalizeSpotifyCandidate(track) {
+    const artist = track?.artists?.[0]?.name || "";
+    const title = track?.name || "";
+
+    if (!title) {
+      return null;
+    }
+
+    return {
+      title,
+      artist,
+      fingerprint: this.buildFingerprint(artist, title),
+      script: this.detectScriptBucket(`${artist} ${title}`)
+    };
+  }
+
+  isAllowedSpotifyCandidate(candidate, context) {
+    if (this.isBlockedTitle(candidate.title)) {
+      return false;
+    }
+
+    if (!candidate.fingerprint || context.fingerprints.has(candidate.fingerprint)) {
+      return false;
+    }
+
+    if (this.isScriptMismatch(candidate.script, context.referenceScript)) {
+      return false;
+    }
+
+    if (this.isAsciiText(context.referenceTrack?.info?.title) && !this.isAsciiText(candidate.title)) {
+      return false;
+    }
+
+    return !this.isSameSongVariant(candidate, context);
+  }
+
+  async resolveSpotifyCandidate(candidate, requester, context) {
+    const node = this.client.playerManager.getSearchNode();
+    const query = [candidate.artist, candidate.title, "official audio"].filter(Boolean).join(" ");
+    const result = await node.rest.resolve(`ytsearch:${query}`);
+    const rawTrack = this.pickSpotifyResolvedTrack(this.music.getLavalinkTracks(result).slice(0, FALLBACK_SEARCH_LIMIT), candidate, context);
+
+    if (!rawTrack) {
+      return null;
+    }
+
+    const track = this.music.createQueueTrack(rawTrack, requester, "Autoplay");
+    track.autoplay = {
+      source: "spotify"
+    };
+    return track;
+  }
+
+  pickSpotifyResolvedTrack(rawTracks, candidate, context) {
+    return rawTracks.find((track) => {
+      if (!track?.encoded || this.isExcludedRawTrack(track, context) || this.isBlockedTitle(track.info?.title)) {
+        return false;
+      }
+
+      const fingerprint = this.buildRawTrackFingerprint(track);
+      if (!fingerprint || context.fingerprints.has(fingerprint)) {
+        return false;
+      }
+
+      if (this.isScriptMismatch(this.detectScriptBucket(`${track.info?.author || ""} ${track.info?.title || ""}`), context.referenceScript)) {
+        return false;
+      }
+
+      return this.textSimilarity(this.normalizeTitle(track.info?.title), this.normalizeTitle(candidate.title)) >= 0.45;
+    }) || null;
   }
 
   async resolveYouTubeSearchFallback(referenceTrack, requester, context) {
@@ -353,7 +508,12 @@ class AutoplayService {
   }
 
   isBlockedTitle(title) {
-    return BLOCKED_TITLE_PATTERN.test(String(title || ""));
+    const normalizedTitle = String(title || "").toLowerCase();
+    return BANNED_WORDS.some((word) => normalizedTitle.includes(word));
+  }
+
+  isAsciiText(value) {
+    return /^[\x00-\x7F]*$/.test(String(value || ""));
   }
 
   getVideoId(track) {
