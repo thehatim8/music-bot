@@ -1,5 +1,29 @@
 const DEFAULT_YTMUSIC_AUTOPLAY_URL = "http://127.0.0.1:3001";
 const REQUEST_TIMEOUT_MS = 3000;
+const MAX_CANDIDATES_TO_TRY = 15;
+
+const SOURCE_SCORES = Object.freeze({
+  artist: 90,
+  watch: 70,
+  related: 45,
+  search: 35,
+  fallback: 20
+});
+
+const TITLE_TOKEN_STOP_WORDS = new Set([
+  "the",
+  "and",
+  "official",
+  "audio",
+  "video",
+  "music",
+  "song",
+  "lyrics",
+  "lyric",
+  "topic",
+  "feat",
+  "ft"
+]);
 
 const BANNED_WORDS = [
   "live",
@@ -26,36 +50,23 @@ class AutoplayService {
     const context = this.buildContext(referenceTrack, excludedTracks);
     const videoId = this.getVideoId(referenceTrack);
 
-    if (!videoId) {
-      return this.resolveFallback(referenceTrack, requester, context);
-    }
+    if (videoId) {
+      try {
+        const track = await this.resolveCandidateList(await this.fetchRelated(videoId), requester, context, {
+          sourceLabel: "Autoplay",
+          decorateAutoplay: true,
+          autoplaySource: "ytmusic"
+        });
 
-    let tracks;
-    try {
-      tracks = await this.fetchRelated(videoId);
-    } catch (error) {
-      console.warn(`YTMusic fetch failed: ${error.message}`);
-      return this.resolveFallback(referenceTrack, requester, context);
-    }
-
-    const filtered = this.filterTracks(tracks, context);
-    if (filtered.length === 0) {
-      console.log("YTMusic empty after filter -> fallback");
-      return this.resolveFallback(referenceTrack, requester, context);
-    }
-
-    const pool = filtered.slice(0, 5);
-    const firstPick = pool[Math.floor(Math.random() * pool.length)];
-    const ordered = [firstPick, ...pool.filter((track) => track.videoId !== firstPick.videoId), ...filtered.slice(5)];
-
-    for (const candidate of ordered) {
-      const track = await this.resolveDirect(candidate, requester, context).catch(() => null);
-      if (track) {
-        return track;
+        if (track) {
+          return track;
+        }
+      } catch (error) {
+        console.warn(`YTMusic related resolver failed: ${error.message}`);
       }
     }
 
-    throw new Error("YTMusic returned recommendations, but none could be played directly.");
+    return this.resolveFallback(requester, context);
   }
 
   async fetchRelated(videoId) {
@@ -90,7 +101,6 @@ class AutoplayService {
         }
 
         const payload = await res.json();
-        console.log("YTMusic fetch success");
         return Array.isArray(payload) ? payload : payload.tracks || [];
       } catch (error) {
         lastError = error;
@@ -104,14 +114,26 @@ class AutoplayService {
 
   async resolveYouTubeMusicSearch(query, requester) {
     const tracks = await this.fetchSearch(query).catch((error) => {
-      console.warn(`YTMusic fetch failed: ${error.message}`);
+      console.warn(`YTMusic search resolver failed: ${error.message}`);
       return [];
     });
-    const context = this.buildSearchContext(query);
-    const filtered = this.filterTracks(tracks, context).slice(0, 5);
 
-    for (const candidate of filtered) {
-      const track = await this.resolveDirect(candidate, requester, context).catch(() => null);
+    return this.resolveCandidateList(tracks, requester, this.buildSearchContext(query), {
+      sourceLabel: "YouTube Music",
+      decorateAutoplay: false
+    });
+  }
+
+  async resolveCandidateList(tracks, requester, context, options = {}) {
+    const filtered = this.filterTracks(tracks, context);
+    if (filtered.length === 0) {
+      return null;
+    }
+
+    const ordered = this.rankTracks(filtered, context).slice(0, MAX_CANDIDATES_TO_TRY);
+
+    for (const candidate of ordered) {
+      const track = await this.resolveCandidate(candidate, requester, context, options).catch(() => null);
       if (track) {
         return track;
       }
@@ -128,10 +150,9 @@ class AutoplayService {
       .map((track) => this.normalizeTrack(track))
       .filter(Boolean)
       .filter((track) => {
-        const title = track.title.toLowerCase();
         const normalizedTitle = this.normalizeText(track.title);
 
-        if (BANNED_WORDS.some((word) => title.includes(word))) {
+        if (this.isBlockedTitle(track.title)) {
           return false;
         }
 
@@ -147,8 +168,8 @@ class AutoplayService {
           return false;
         }
 
-        const key = `${this.normalizeText(track.artist)}:${normalizedTitle}`;
-        if (seen.has(track.videoId) || context.fingerprints.has(key)) {
+        const fingerprint = this.getCandidateFingerprint(track, normalizedTitle);
+        if (seen.has(track.videoId) || (fingerprint && context.fingerprints.has(fingerprint))) {
           return false;
         }
 
@@ -157,7 +178,61 @@ class AutoplayService {
       });
   }
 
-  async resolveDirect(candidate, requester, context) {
+  rankTracks(tracks, context) {
+    return tracks
+      .map((track, index) => ({
+        track,
+        index,
+        score: this.scoreTrack(track, context)
+      }))
+      .sort((left, right) => right.score - left.score || left.index - right.index)
+      .map((entry) => entry.track);
+  }
+
+  scoreTrack(track, context) {
+    const profile = this.buildProfile(track.title, this.getArtistNames(track));
+    const sharedSeedArtists = this.countSharedValues(profile.normalizedArtists, context.seedProfile.normalizedArtists);
+    const sharedCurrentArtists = this.countSharedValues(profile.normalizedArtists, context.currentProfile.normalizedArtists);
+    const seedTitleOverlap = this.countSharedValues(profile.titleTokens, context.seedProfile.titleTokens);
+    const currentTitleOverlap = this.countSharedValues(profile.titleTokens, context.currentProfile.titleTokens);
+
+    let score = this.getSourceScore(track.source);
+
+    if (sharedSeedArtists > 0) {
+      score += 220 + sharedSeedArtists * 50;
+    } else if (context.seedProfile.normalizedArtists.size > 0) {
+      score -= 110;
+    }
+
+    if (sharedCurrentArtists > 0) {
+      score += 140 + sharedCurrentArtists * 40;
+    } else if (context.currentProfile.normalizedArtists.size > 0) {
+      score -= 30;
+    }
+
+    if (context.seedProfile.primaryArtist && profile.primaryArtist === context.seedProfile.primaryArtist) {
+      score += 90;
+    }
+
+    if (context.currentProfile.primaryArtist && profile.primaryArtist === context.currentProfile.primaryArtist) {
+      score += 50;
+    }
+
+    score += Math.min(seedTitleOverlap * 6, 18);
+    score += Math.min(currentTitleOverlap * 8, 24);
+
+    if (!profile.primaryArtist) {
+      score -= 20;
+    }
+
+    if (track.source === "related" && sharedSeedArtists === 0 && sharedCurrentArtists === 0) {
+      score -= 15;
+    }
+
+    return score;
+  }
+
+  async resolveCandidate(candidate, requester, context, options = {}) {
     const node = this.client.playerManager.getSearchNode();
     const result = await node.rest.resolve(`https://www.youtube.com/watch?v=${candidate.videoId}`);
     const rawTrack = this.music.getLavalinkTracks(result).find((track) => {
@@ -177,45 +252,150 @@ class AutoplayService {
       return null;
     }
 
-    const track = this.music.createQueueTrack(rawTrack, requester, "Autoplay");
-    track.autoplay = {
-      videoId: candidate.videoId,
-      source: "ytmusic"
-    };
-    return track;
-  }
-
-  async resolveFallback(referenceTrack, requester, context) {
-    const node = this.client.playerManager.getSearchNode();
-    const title = this.cleanTitle(referenceTrack?.info?.title);
-    const author = this.cleanArtist(referenceTrack?.info?.author);
-    const query = [author, title, "official audio"].filter(Boolean).join(" ");
-
-    if (!query) {
-      throw new Error("I could not find a similar song for autoplay.");
-    }
-
-    const result = await node.rest.resolve(`ytsearch:${query}`);
-    const rawTrack = this.music.getLavalinkTracks(result).find((track) => {
-      if (!track?.encoded || this.isBlockedTitle(track.info?.title)) {
-        return false;
-      }
-
-      const videoId = this.getRawVideoId(track);
-      return !videoId || (videoId !== context.currentVideoId && !context.history.has(videoId));
+    const queueTrack = this.music.createQueueTrack(rawTrack, requester, options.sourceLabel || "Autoplay", {
+      title: candidate.title,
+      artists: this.getArtistNames(candidate)
     });
 
-    if (!rawTrack) {
-      throw new Error("I could not find a similar song for autoplay.");
+    if (options.decorateAutoplay) {
+      this.decorateTrackForAutoplay(queueTrack, candidate, context, options.autoplaySource || "ytmusic");
     }
 
-    return this.music.createQueueTrack(rawTrack, requester, "Autoplay");
+    return queueTrack;
+  }
+
+  decorateTrackForAutoplay(track, candidate, context, source) {
+    track.autoplay = {
+      videoId: candidate.videoId,
+      source,
+      bucket: candidate.source || "related",
+      seed: {
+        videoId: context.seedData.videoId,
+        title: context.seedData.title,
+        artists: [...context.seedData.artists]
+      },
+      candidate: {
+        videoId: candidate.videoId,
+        title: candidate.title,
+        artist: candidate.artist,
+        artists: candidate.artists.map((artist) => ({ ...artist })),
+        source: candidate.source || "related"
+      }
+    };
+  }
+
+  async resolveFallback(requester, context) {
+    const queries = this.buildFallbackQueries(context);
+
+    for (const query of queries) {
+      const track = await this.fetchSearch(query)
+        .then((tracks) =>
+          this.resolveCandidateList(tracks, requester, context, {
+            sourceLabel: "Autoplay",
+            decorateAutoplay: true,
+            autoplaySource: "ytmusic"
+          })
+        )
+        .catch(() => null);
+
+      if (track) {
+        return track;
+      }
+    }
+
+    const lavalinkTrack = await this.resolveLavalinkFallback(queries, requester, context);
+    if (lavalinkTrack) {
+      return lavalinkTrack;
+    }
+
+    throw new Error("I could not find a relevant song for autoplay.");
+  }
+
+  buildFallbackQueries(context) {
+    const queries = [];
+    const seen = new Set();
+
+    const addQuery = (value) => {
+      const query = String(value || "").replace(/\s+/g, " ").trim();
+      const key = this.normalizeText(query);
+
+      if (!query || key.length < 4 || seen.has(key)) {
+        return;
+      }
+
+      seen.add(key);
+      queries.push(query);
+    };
+
+    const seedArtist = context.seedProfile.primaryArtistName;
+    const currentArtist = context.currentProfile.primaryArtistName;
+    const seedTitle = context.seedProfile.cleanedTitle;
+    const currentTitle = context.currentProfile.cleanedTitle;
+
+    addQuery([seedArtist, currentTitle].filter(Boolean).join(" "));
+    addQuery([currentArtist, currentTitle].filter(Boolean).join(" "));
+    addQuery([seedArtist, seedTitle].filter(Boolean).join(" "));
+    addQuery([currentArtist, seedTitle].filter(Boolean).join(" "));
+
+    if (seedArtist) {
+      addQuery(`${seedArtist} popular songs`);
+    }
+
+    if (currentArtist && this.normalizeText(currentArtist) !== this.normalizeText(seedArtist)) {
+      addQuery(`${currentArtist} popular songs`);
+    }
+
+    return queries.slice(0, 6);
+  }
+
+  async resolveLavalinkFallback(queries, requester, context) {
+    const node = this.client.playerManager.getSearchNode();
+
+    for (const query of queries) {
+      const result = await node.rest.resolve(`ytsearch:${query}`).catch(() => null);
+      if (!result) {
+        continue;
+      }
+
+      const candidates = this.music
+        .getLavalinkTracks(result)
+        .map((rawTrack) => this.normalizeLavalinkTrack(rawTrack))
+        .filter(Boolean)
+        .filter((candidate) => {
+          if (candidate.videoId && (candidate.videoId === context.currentVideoId || context.history.has(candidate.videoId))) {
+            return false;
+          }
+
+          if (this.isSameTitleVariant(this.normalizeText(candidate.title), context.currentTitles)) {
+            return false;
+          }
+
+          return !this.isBlockedTitle(candidate.title);
+        });
+
+      const ordered = this.rankTracks(candidates, context).slice(0, MAX_CANDIDATES_TO_TRY);
+
+      for (const candidate of ordered) {
+        const queueTrack = this.music.createQueueTrack(candidate.rawTrack, requester, "Autoplay", {
+          title: candidate.title,
+          artists: this.getArtistNames(candidate)
+        });
+
+        this.decorateTrackForAutoplay(queueTrack, candidate, context, "ytsearch");
+        return queueTrack;
+      }
+    }
+
+    return null;
   }
 
   buildContext(referenceTrack, excludedTracks) {
     const tracks = [referenceTrack, ...excludedTracks].filter(Boolean);
     const history = new Set();
     const fingerprints = new Set();
+    const currentProfile = this.getTrackProfile(referenceTrack);
+    const seedData = this.getSeedData(referenceTrack, currentProfile);
+    const seedProfile = this.buildProfile(seedData.title, seedData.artists);
 
     for (const track of tracks.slice(-20)) {
       const videoId = this.getVideoId(track);
@@ -223,8 +403,8 @@ class AutoplayService {
         history.add(videoId);
       }
 
-      const fingerprint = `${this.normalizeText(track.info?.author)}:${this.normalizeText(track.info?.title)}`;
-      if (fingerprint !== ":") {
+      const fingerprint = this.getProfileFingerprint(this.getTrackProfile(track));
+      if (fingerprint) {
         fingerprints.add(fingerprint);
       }
     }
@@ -234,39 +414,139 @@ class AutoplayService {
       history.add(currentVideoId);
     }
 
-    const currentAuthor = this.normalizeText(this.cleanArtist(referenceTrack?.info?.author));
-    const currentTitle = this.normalizeText(this.cleanTitle(referenceTrack?.info?.title));
-    const currentTitleWithoutAuthor =
-      currentAuthor && currentTitle.startsWith(currentAuthor)
-        ? currentTitle.slice(currentAuthor.length).trim()
-        : currentTitle;
-    const currentTitles = new Set(
-      [currentTitle, currentTitleWithoutAuthor]
-        .map((title) => title.replace(/^\s*[-:]\s*/, "").trim())
-        .filter((title) => title.length >= 6)
-    );
-    const currentFingerprint = `${currentAuthor}:${currentTitle}`;
-    if (currentFingerprint !== ":") {
-      fingerprints.add(currentFingerprint);
-    }
-
     return {
       currentVideoId,
-      currentRawTitle: referenceTrack?.info?.title || "",
-      currentTitles,
+      currentRawTitle: referenceTrack?.info?.title || seedData.title || "",
+      currentTitles: this.buildTitleVariants(currentProfile),
       history,
-      fingerprints
+      fingerprints,
+      currentProfile,
+      seedProfile,
+      seedData
     };
   }
 
   buildSearchContext(query) {
+    const profile = this.buildProfile(query, []);
+
     return {
       currentVideoId: null,
       currentRawTitle: query || "",
       currentTitles: new Set(),
       history: new Set(),
-      fingerprints: new Set()
+      fingerprints: new Set(),
+      currentProfile: profile,
+      seedProfile: profile,
+      seedData: {
+        videoId: null,
+        title: profile.cleanedTitle,
+        artists: profile.artistNames
+      }
     };
+  }
+
+  getTrackProfile(track) {
+    return this.buildProfile(
+      track?.canonical?.title || track?.autoplay?.candidate?.title || track?.info?.title,
+      this.getTrackArtistNames(track)
+    );
+  }
+
+  getTrackArtistNames(track) {
+    if (Array.isArray(track?.canonical?.artists) && track.canonical.artists.length > 0) {
+      return track.canonical.artists;
+    }
+
+    if (Array.isArray(track?.autoplay?.candidate?.artists) && track.autoplay.candidate.artists.length > 0) {
+      return track.autoplay.candidate.artists.map((artist) => artist?.name || artist);
+    }
+
+    return this.extractArtistNames(track?.info?.author);
+  }
+
+  getSeedData(referenceTrack, currentProfile) {
+    const seed = referenceTrack?.autoplay?.seed;
+
+    if (seed) {
+      return {
+        videoId: this.cleanVideoId(seed.videoId) || this.getVideoId(referenceTrack),
+        title: String(seed.title || currentProfile.cleanedTitle || currentProfile.rawTitle || "").trim(),
+        artists: this.normalizeArtistNames(seed.artists)
+      };
+    }
+
+    return {
+      videoId: this.getVideoId(referenceTrack),
+      title: currentProfile.cleanedTitle || currentProfile.rawTitle,
+      artists: [...currentProfile.artistNames]
+    };
+  }
+
+  buildProfile(title, artists) {
+    const rawTitle = String(title || "").trim();
+    const cleanedTitle = this.cleanTitle(rawTitle);
+    const artistNames = this.normalizeArtistNames(artists);
+    const normalizedArtists = new Set(
+      artistNames
+        .map((artist) => this.normalizeText(this.cleanArtist(artist)))
+        .filter(Boolean)
+    );
+
+    return {
+      rawTitle,
+      cleanedTitle,
+      normalizedTitle: this.normalizeText(cleanedTitle),
+      titleTokens: this.tokenizeTitle(cleanedTitle),
+      artistNames,
+      normalizedArtists,
+      primaryArtistName: artistNames[0] || "",
+      primaryArtist: normalizedArtists.values().next().value || ""
+    };
+  }
+
+  buildTitleVariants(profile) {
+    const titles = new Set();
+    const normalizedTitle = profile.normalizedTitle;
+
+    if (normalizedTitle.length >= 6) {
+      titles.add(normalizedTitle);
+    }
+
+    if (profile.primaryArtist && normalizedTitle.startsWith(profile.primaryArtist)) {
+      const withoutArtist = normalizedTitle
+        .slice(profile.primaryArtist.length)
+        .replace(/^\s*[-:]\s*/, "")
+        .trim();
+
+      if (withoutArtist.length >= 6) {
+        titles.add(withoutArtist);
+      }
+    }
+
+    return titles;
+  }
+
+  getProfileFingerprint(profile) {
+    const artistKey = [...profile.normalizedArtists].sort().join("|");
+    if (!artistKey && !profile.normalizedTitle) {
+      return null;
+    }
+
+    return `${artistKey}:${profile.normalizedTitle}`;
+  }
+
+  getCandidateFingerprint(track, normalizedTitle) {
+    const artistKey = this.getArtistNames(track)
+      .map((artist) => this.normalizeText(this.cleanArtist(artist)))
+      .filter(Boolean)
+      .sort()
+      .join("|");
+
+    if (!artistKey && !normalizedTitle) {
+      return null;
+    }
+
+    return `${artistKey}:${normalizedTitle}`;
   }
 
   normalizeTrack(track) {
@@ -277,11 +557,138 @@ class AutoplayService {
       return null;
     }
 
+    const artists = this.normalizeArtistEntries(track?.artists, track?.artist);
+
     return {
       videoId,
       title,
-      artist: String(track?.artist || "").trim()
+      artist: artists[0]?.name || String(track?.artist || "").trim(),
+      artists,
+      source: this.normalizeSource(track?.source)
     };
+  }
+
+  normalizeLavalinkTrack(rawTrack) {
+    if (!rawTrack?.encoded || !rawTrack.info?.title) {
+      return null;
+    }
+
+    const artist = String(rawTrack.info.author || "").trim();
+
+    return {
+      rawTrack,
+      videoId: this.getRawVideoId(rawTrack),
+      title: rawTrack.info.title,
+      artist,
+      artists: this.normalizeArtistEntries(null, artist),
+      source: "fallback"
+    };
+  }
+
+  normalizeArtistEntries(artists, fallbackArtist) {
+    const entries = [];
+
+    if (Array.isArray(artists)) {
+      for (const artist of artists) {
+        const name = String(typeof artist === "string" ? artist : artist?.name || "").trim();
+        const id = String(typeof artist === "object" ? artist?.id || "" : "").trim() || undefined;
+
+        if (!name) {
+          continue;
+        }
+
+        entries.push({ name, id });
+      }
+    }
+
+    if (entries.length === 0) {
+      for (const artist of this.extractArtistNames(fallbackArtist)) {
+        entries.push({ name: artist });
+      }
+    }
+
+    const seen = new Set();
+    return entries.filter((artist) => {
+      const key = this.normalizeText(this.cleanArtist(artist.name));
+      if (!key || seen.has(key)) {
+        return false;
+      }
+
+      seen.add(key);
+      return true;
+    });
+  }
+
+  normalizeArtistNames(artists) {
+    const seen = new Set();
+    const output = [];
+
+    for (const artist of Array.isArray(artists) ? artists : []) {
+      const name = String(typeof artist === "string" ? artist : artist?.name || "").trim();
+      const key = this.normalizeText(this.cleanArtist(name));
+
+      if (!key || seen.has(key)) {
+        continue;
+      }
+
+      seen.add(key);
+      output.push(name);
+    }
+
+    return output;
+  }
+
+  getArtistNames(track) {
+    if (Array.isArray(track?.artists) && track.artists.length > 0) {
+      return track.artists.map((artist) => artist?.name || artist).filter(Boolean);
+    }
+
+    return this.extractArtistNames(track?.artist);
+  }
+
+  extractArtistNames(value) {
+    const cleaned = this.cleanArtist(value);
+    if (!cleaned) {
+      return [];
+    }
+
+    return [cleaned, ...cleaned
+      .split(/\s+(?:feat\.?|ft\.?|with|x|and|&|\/)\s+/i)
+      .map((artist) => artist.trim())
+      .filter(Boolean)];
+  }
+
+  normalizeSource(value) {
+    const source = String(value || "").trim().toLowerCase();
+    return SOURCE_SCORES[source] ? source : "related";
+  }
+
+  getSourceScore(source) {
+    return SOURCE_SCORES[this.normalizeSource(source)] || SOURCE_SCORES.related;
+  }
+
+  countSharedValues(left, right) {
+    if (!left?.size || !right?.size) {
+      return 0;
+    }
+
+    let count = 0;
+
+    for (const value of left) {
+      if (right.has(value)) {
+        count += 1;
+      }
+    }
+
+    return count;
+  }
+
+  tokenizeTitle(value) {
+    return new Set(
+      this.normalizeText(value)
+        .split(" ")
+        .filter((token) => token.length > 2 && !TITLE_TOKEN_STOP_WORDS.has(token))
+    );
   }
 
   isBlockedTitle(title) {

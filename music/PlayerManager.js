@@ -204,7 +204,32 @@ class PlayerManager {
       encoded: track.encoded,
       info: { ...track.info },
       requester: { ...track.requester },
-      sourceLabel: track.sourceLabel
+      sourceLabel: track.sourceLabel,
+      canonical: track.canonical
+        ? {
+            title: track.canonical.title,
+            artists: [...(track.canonical.artists || [])]
+          }
+        : undefined,
+      autoplay: track.autoplay
+        ? {
+            ...track.autoplay,
+            seed: track.autoplay.seed
+              ? {
+                  ...track.autoplay.seed,
+                  artists: [...(track.autoplay.seed.artists || [])]
+                }
+              : undefined,
+            candidate: track.autoplay.candidate
+              ? {
+                  ...track.autoplay.candidate,
+                  artists: Array.isArray(track.autoplay.candidate.artists)
+                    ? track.autoplay.candidate.artists.map((artist) => ({ ...artist }))
+                    : []
+                }
+              : undefined
+          }
+        : undefined
     };
   }
 

@@ -19,9 +19,9 @@ class MusicService {
     }
   }
 
-  createQueueTrack(rawTrack, requester, sourceLabel) {
+  createQueueTrack(rawTrack, requester, sourceLabel, canonical = null) {
     const artworkUrl = rawTrack.info.artworkUrl || rawTrack.pluginInfo?.artworkUrl || null;
-    return {
+    const track = {
       raw: rawTrack,
       encoded: rawTrack.encoded,
       info: {
@@ -36,6 +36,22 @@ class MusicService {
       },
       sourceLabel
     };
+
+    const canonicalTitle = String(canonical?.title || "").trim();
+    const canonicalArtists = Array.isArray(canonical?.artists)
+      ? canonical.artists
+          .map((artist) => String(artist || "").trim())
+          .filter(Boolean)
+      : [];
+
+    if (canonicalTitle || canonicalArtists.length > 0) {
+      track.canonical = {
+        title: canonicalTitle || track.info.title || "",
+        artists: canonicalArtists
+      };
+    }
+
+    return track;
   }
 
   async resolveInput(query, requester, options = {}) {
@@ -123,6 +139,11 @@ class MusicService {
       firstTrack.info.artworkUrl = track.artworkUrl;
     }
 
+    firstTrack.canonical = {
+      title: track.name,
+      artists: track.artists.map((artist) => artist.name)
+    };
+
     return {
       type: "track",
       source: "spotify",
@@ -146,6 +167,13 @@ class MusicService {
           const firstTrack = result.tracks[0];
           if (firstTrack && track.artworkUrl && !firstTrack.info.artworkUrl) {
             firstTrack.info.artworkUrl = track.artworkUrl;
+          }
+
+          if (firstTrack) {
+            firstTrack.canonical = {
+              title: track.name,
+              artists: track.artists.map((artist) => artist.name)
+            };
           }
 
           return firstTrack || null;

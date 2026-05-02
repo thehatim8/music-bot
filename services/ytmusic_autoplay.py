@@ -6,44 +6,79 @@ from urllib.parse import parse_qs, urlparse
 from ytmusicapi import YTMusic
 
 
-WATCH_LIMIT = 25
-MAX_RESULTS = 15
-MIN_RESULTS_BEFORE_FALLBACK = 10
-SEARCH_LIMIT = 10
+WATCH_LIMIT = 40
+MAX_RESULTS = 25
+SEARCH_LIMIT = 12
 
 ytmusic = YTMusic()
 
 
-def artist_name(item):
-    artists = item.get("artists")
-    if isinstance(artists, list) and artists:
-        first = artists[0]
-        if isinstance(first, dict) and first.get("name"):
-            return first["name"]
+def normalize_artist_entry(artist):
+    if isinstance(artist, dict):
+        name = str(artist.get("name") or "").strip()
+        artist_id = str(artist.get("id") or artist.get("browseId") or "").strip()
+        if name:
+            payload = {"name": name}
+            if artist_id:
+                payload["id"] = artist_id
+            return payload
 
-    if item.get("artist"):
-        return item["artist"]
+    if isinstance(artist, str):
+        name = artist.strip()
+        if name:
+            return {"name": name}
+
+    return None
+
+
+def artist_entries(item):
+    artists = item.get("artists")
+    output = []
+    seen = set()
+
+    if isinstance(artists, list):
+        for artist in artists:
+            entry = normalize_artist_entry(artist)
+            if not entry:
+                continue
+
+            key = entry["name"].casefold()
+            if key in seen:
+                continue
+
+            seen.add(key)
+            output.append(entry)
+
+    if output:
+        return output
+
+    fallback = item.get("artist")
+    if isinstance(fallback, str) and fallback.strip():
+        return [{"name": fallback.strip()}]
 
     byline = item.get("byline")
     if isinstance(byline, str) and byline:
-        return byline.split(" \u2022 ", 1)[0].strip()
+        name = byline.split(" \u2022 ", 1)[0].strip()
+        if name:
+            return [{"name": name}]
 
-    return ""
+    return []
+
+
+def artist_name(item):
+    artists = artist_entries(item)
+    return artists[0]["name"] if artists else ""
 
 
 def artist_ids(item):
-    artists = item.get("artists")
-    if not isinstance(artists, list):
-        return []
-
     return [
-        artist.get("id")
-        for artist in artists
-        if isinstance(artist, dict) and artist.get("id")
+        artist["id"]
+        for artist in artist_entries(item)
+        if artist.get("id")
     ]
 
 
-def normalize_track(item):
+def normalize_track(item, source):
     if not isinstance(item, dict):
         return None
 
@@ -53,16 +88,23 @@ def normalize_track(item):
     if not video_id or not title:
         return None
 
+    artists = artist_entries(item)
+
     return {
         "videoId": video_id,
         "title": title,
-        "artist": artist_name(item)
+        "artist": artists[0]["name"] if artists else artist_name(item),
+        "artists": artists,
+        "source": source
     }
 
 
-def add_tracks(output, seen, items):
+def add_tracks(output, seen, items, source, predicate=None):
     for item in items or []:
-        track = normalize_track(item)
+        if predicate and not predicate(item):
+            continue
+
+        track = normalize_track(item, source)
         if not track or track["videoId"] in seen:
             continue
 
@@ -124,22 +166,25 @@ def get_recommendations(video_id):
     output = []
     watch = ytmusic.get_watch_playlist(videoId=video_id, limit=WATCH_LIMIT)
     watch_tracks = watch.get("tracks") or []
+    seed_track = next((item for item in watch_tracks if item.get("videoId") == video_id), None)
+    seed_track = seed_track or (watch_tracks[0] if watch_tracks else {})
+    seed_artist_ids = list(dict.fromkeys(artist_ids(seed_track)))
+    related = related_tracks(related_browse_id(watch))
 
-    add_tracks(output, seen, watch_tracks)
+    def same_artist(item):
+        item_artist_ids = set(artist_ids(item))
+        return bool(item_artist_ids.intersection(seed_artist_ids)) if seed_artist_ids else False
 
-    if len(output) < MIN_RESULTS_BEFORE_FALLBACK:
-        add_tracks(output, seen, related_tracks(related_browse_id(watch)))
+    add_tracks(output, seen, watch_tracks, "watch", predicate=same_artist)
 
-    if len(output) < MIN_RESULTS_BEFORE_FALLBACK:
-        ids = []
-        for item in watch_tracks:
-            ids.extend(artist_ids(item))
+    for artist_id in seed_artist_ids:
+        add_tracks(output, seen, artist_tracks(artist_id), "artist")
+        if len(output) >= MAX_RESULTS:
+            return output[:MAX_RESULTS]
 
-        for artist_id in dict.fromkeys(ids):
-            add_tracks(output, seen, artist_tracks(artist_id))
-            if len(output) >= MIN_RESULTS_BEFORE_FALLBACK:
-                break
-
+    add_tracks(output, seen, related, "related", predicate=same_artist)
+    add_tracks(output, seen, watch_tracks, "watch")
+    add_tracks(output, seen, related, "related")
     return output[:MAX_RESULTS]
 
 
@@ -147,7 +192,7 @@ def get_search_results(query):
     results = ytmusic.search(query, filter="songs", limit=SEARCH_LIMIT)
     output = []
     seen = set()
-    add_tracks(output, seen, results)
+    add_tracks(output, seen, results, "search")
     return output[:SEARCH_LIMIT]
 
 
