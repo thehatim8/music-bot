@@ -901,11 +901,14 @@ class AutoplayService {
 
     const sameCoreTitle =
       left.normalizedCoreTitle === right.normalizedCoreTitle ||
-      this.isSameTitleVariant(left.normalizedCoreTitle, new Set([right.normalizedCoreTitle]));
+      this.isSameTitleVariant(left.normalizedCoreTitle, new Set([right.normalizedCoreTitle])) ||
+      this.areTitlesFuzzyDuplicate(left, right);
 
     const sharedCoreTokens = this.countSharedValues(left.coreTitleTokens, right.coreTitleTokens);
     const minimumCoreTokens = Math.min(left.coreTitleTokens.size, right.coreTitleTokens.size);
-    const coreTokensEquivalent = minimumCoreTokens >= 2 && sharedCoreTokens === minimumCoreTokens;
+    const coreTokensEquivalent =
+      (minimumCoreTokens >= 2 && sharedCoreTokens === minimumCoreTokens) ||
+      this.haveEquivalentCoreTokens(left.coreTitleTokens, right.coreTitleTokens);
 
     if (!sameCoreTitle && !coreTokensEquivalent) {
       return false;
@@ -933,6 +936,82 @@ class AutoplayService {
     return profile.coreTitleTokens.size >= 2 || profile.normalizedCoreTitle.length >= 10;
   }
 
+  areTitlesFuzzyDuplicate(left, right) {
+    const leftTitle = left.normalizedCoreTitle;
+    const rightTitle = right.normalizedCoreTitle;
+
+    if (!leftTitle || !rightTitle) {
+      return false;
+    }
+
+    const maxLength = Math.max(leftTitle.length, rightTitle.length);
+    if (maxLength < 8) {
+      return false;
+    }
+
+    const similarity = this.calculateStringSimilarity(leftTitle, rightTitle);
+    if (similarity >= 0.94) {
+      return true;
+    }
+
+    if (similarity >= 0.9 && this.haveEquivalentCoreTokens(left.coreTitleTokens, right.coreTitleTokens, 0.78)) {
+      return true;
+    }
+
+    return false;
+  }
+
+  haveEquivalentCoreTokens(leftTokens, rightTokens, threshold = 0.84) {
+    const left = Array.from(leftTokens || []);
+    const right = Array.from(rightTokens || []);
+
+    if (left.length === 0 || right.length === 0) {
+      return false;
+    }
+
+    if (Math.abs(left.length - right.length) > 1) {
+      return false;
+    }
+
+    const unmatched = [...right];
+    let matched = 0;
+
+    for (const token of left) {
+      const matchIndex = unmatched.findIndex((candidate) => this.areEquivalentTokens(token, candidate, threshold));
+      if (matchIndex === -1) {
+        continue;
+      }
+
+      unmatched.splice(matchIndex, 1);
+      matched += 1;
+    }
+
+    const minimumTokens = Math.min(left.length, right.length);
+    return minimumTokens >= 2 && matched === minimumTokens;
+  }
+
+  areEquivalentTokens(left, right, threshold = 0.84) {
+    if (!left || !right) {
+      return false;
+    }
+
+    if (left === right) {
+      return true;
+    }
+
+    const maxLength = Math.max(left.length, right.length);
+    if (maxLength <= 3) {
+      return false;
+    }
+
+    const similarity = this.calculateStringSimilarity(left, right);
+    if (similarity >= threshold) {
+      return true;
+    }
+
+    return left.length >= 5 && right.length >= 5 && this.stripVowels(left) === this.stripVowels(right);
+  }
+
   normalizeSource(value) {
     const source = String(value || "").trim().toLowerCase();
     return SOURCE_SCORES[source] ? source : "related";
@@ -956,6 +1035,59 @@ class AutoplayService {
     }
 
     return count;
+  }
+
+  calculateStringSimilarity(left, right) {
+    const a = String(left || "");
+    const b = String(right || "");
+
+    if (!a && !b) {
+      return 1;
+    }
+
+    const maxLength = Math.max(a.length, b.length);
+    if (maxLength === 0) {
+      return 1;
+    }
+
+    return 1 - this.calculateLevenshteinDistance(a, b) / maxLength;
+  }
+
+  calculateLevenshteinDistance(left, right) {
+    const a = String(left || "");
+    const b = String(right || "");
+
+    if (a === b) {
+      return 0;
+    }
+
+    if (!a.length) {
+      return b.length;
+    }
+
+    if (!b.length) {
+      return a.length;
+    }
+
+    const previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+
+    for (let row = 1; row <= a.length; row += 1) {
+      let diagonal = previous[0];
+      previous[0] = row;
+
+      for (let column = 1; column <= b.length; column += 1) {
+        const current = previous[column];
+        const cost = a[row - 1] === b[column - 1] ? 0 : 1;
+        previous[column] = Math.min(
+          previous[column] + 1,
+          previous[column - 1] + 1,
+          diagonal + cost
+        );
+        diagonal = current;
+      }
+    }
+
+    return previous[b.length];
   }
 
   tokenizeTitle(value) {
@@ -1062,6 +1194,10 @@ class AutoplayService {
   normalizeStrictArtistTrackCount(value) {
     const numeric = Number(value);
     return Number.isFinite(numeric) && numeric > 0 ? Math.max(1, Math.floor(numeric)) : STRICT_SEED_ARTIST_TRACK_COUNT;
+  }
+
+  stripVowels(value) {
+    return String(value || "").replace(/[aeiou]/g, "");
   }
 
   escapeRegExp(value) {
