@@ -151,13 +151,15 @@ class AutoplayService {
 
   filterTracks(tracks, context) {
     const seen = new Set();
+    const seenProfiles = [];
     const currentIsLatin = this.isAsciiText(context.currentRawTitle);
 
     return (Array.isArray(tracks) ? tracks : [])
       .map((track) => this.normalizeTrack(track))
       .filter(Boolean)
       .filter((track) => {
-        const normalizedTitle = this.normalizeText(track.title);
+        const profile = track.profile || this.buildProfile(track.title, this.getArtistNames(track));
+        track.profile = profile;
 
         if (this.isBlockedTitle(track.title)) {
           return false;
@@ -167,7 +169,10 @@ class AutoplayService {
           return false;
         }
 
-        if (this.isSameTitleVariant(normalizedTitle, context.currentTitles)) {
+        if (
+          this.isSameTitleVariant(profile.normalizedTitle, context.currentTitles) ||
+          this.isSameTitleVariant(profile.normalizedCoreTitle, context.currentTitles)
+        ) {
           return false;
         }
 
@@ -175,12 +180,20 @@ class AutoplayService {
           return false;
         }
 
-        const fingerprint = this.getCandidateFingerprint(track, normalizedTitle);
+        const fingerprint = this.getCandidateFingerprint(track, profile);
         if (seen.has(track.videoId) || (fingerprint && context.fingerprints.has(fingerprint))) {
           return false;
         }
 
+        if (
+          this.isDuplicateProfileInCollection(profile, context.trackProfiles) ||
+          this.isDuplicateProfileInCollection(profile, seenProfiles)
+        ) {
+          return false;
+        }
+
         seen.add(track.videoId);
+        seenProfiles.push(profile);
         return true;
       });
   }
@@ -294,7 +307,16 @@ class AutoplayService {
         return false;
       }
 
-      return !this.isBlockedTitle(track.info?.title) && !context.history.has(resolvedVideoId);
+      if (this.isBlockedTitle(track.info?.title) || context.history.has(resolvedVideoId)) {
+        return false;
+      }
+
+      const resolvedProfile = this.buildProfile(track.info?.title, this.extractArtistNames(track.info?.author));
+      if (this.isDuplicateProfileInCollection(resolvedProfile, context.trackProfiles)) {
+        return false;
+      }
+
+      return true;
     });
 
     if (!rawTrack) {
@@ -463,6 +485,10 @@ class AutoplayService {
           artists: this.getArtistNames(candidate)
         });
 
+        if (this.isDuplicateProfileInCollection(this.getTrackProfile(queueTrack), context.trackProfiles)) {
+          continue;
+        }
+
         this.decorateTrackForAutoplay(queueTrack, candidate, context, "ytsearch");
         return queueTrack;
       }
@@ -475,6 +501,7 @@ class AutoplayService {
     const tracks = [referenceTrack, ...excludedTracks].filter(Boolean);
     const history = new Set();
     const fingerprints = new Set();
+    const trackProfiles = [];
     const currentProfile = this.getTrackProfile(referenceTrack);
     const seedData = this.getSeedData(referenceTrack, currentProfile);
     const seedProfile = this.buildProfile(seedData.title, seedData.artists);
@@ -487,9 +514,14 @@ class AutoplayService {
         history.add(videoId);
       }
 
-      const fingerprint = this.getProfileFingerprint(this.getTrackProfile(track));
+      const profile = this.getTrackProfile(track);
+      const fingerprint = this.getProfileFingerprint(profile);
       if (fingerprint) {
         fingerprints.add(fingerprint);
+      }
+
+      if (profile?.normalizedCoreTitle || profile?.normalizedTitle) {
+        trackProfiles.push(profile);
       }
     }
 
@@ -504,6 +536,7 @@ class AutoplayService {
       currentTitles: this.buildTitleVariants(currentProfile),
       history,
       fingerprints,
+      trackProfiles,
       currentProfile,
       seedProfile,
       seedData,
@@ -522,6 +555,7 @@ class AutoplayService {
       currentTitles: new Set(),
       history: new Set(),
       fingerprints: new Set(),
+      trackProfiles: [],
       currentProfile: profile,
       seedProfile: profile,
       seedData: {
@@ -584,12 +618,17 @@ class AutoplayService {
         .map((artist) => this.normalizeText(this.cleanArtist(artist)))
         .filter(Boolean)
     );
+    const coreTitle = this.extractCoreTitle(cleanedTitle, artistNames);
+    const normalizedCoreTitle = this.normalizeText(coreTitle);
 
     return {
       rawTitle,
       cleanedTitle,
       normalizedTitle: this.normalizeText(cleanedTitle),
       titleTokens: this.tokenizeTitle(cleanedTitle),
+      coreTitle,
+      normalizedCoreTitle,
+      coreTitleTokens: this.tokenizeTitle(coreTitle),
       artistNames,
       normalizedArtists,
       primaryArtistName: artistNames[0] || "",
@@ -600,9 +639,14 @@ class AutoplayService {
   buildTitleVariants(profile) {
     const titles = new Set();
     const normalizedTitle = profile.normalizedTitle;
+    const normalizedCoreTitle = profile.normalizedCoreTitle;
 
     if (normalizedTitle.length >= 6) {
       titles.add(normalizedTitle);
+    }
+
+    if (normalizedCoreTitle.length >= 4) {
+      titles.add(normalizedCoreTitle);
     }
 
     if (profile.primaryArtist && normalizedTitle.startsWith(profile.primaryArtist)) {
@@ -621,25 +665,28 @@ class AutoplayService {
 
   getProfileFingerprint(profile) {
     const artistKey = [...profile.normalizedArtists].sort().join("|");
-    if (!artistKey && !profile.normalizedTitle) {
+    const titleKey = profile.normalizedCoreTitle || profile.normalizedTitle;
+
+    if (!artistKey && !titleKey) {
       return null;
     }
 
-    return `${artistKey}:${profile.normalizedTitle}`;
+    return `${artistKey}:${titleKey}`;
   }
 
-  getCandidateFingerprint(track, normalizedTitle) {
+  getCandidateFingerprint(track, profile) {
     const artistKey = this.getArtistNames(track)
       .map((artist) => this.normalizeText(this.cleanArtist(artist)))
       .filter(Boolean)
       .sort()
       .join("|");
+    const titleKey = profile?.normalizedCoreTitle || profile?.normalizedTitle || "";
 
-    if (!artistKey && !normalizedTitle) {
+    if (!artistKey && !titleKey) {
       return null;
     }
 
-    return `${artistKey}:${normalizedTitle}`;
+    return `${artistKey}:${titleKey}`;
   }
 
   normalizeTrack(track) {
@@ -762,6 +809,128 @@ class AutoplayService {
       const normalizedArtist = this.normalizeText(this.cleanArtist(artist));
       return normalizedArtist.length >= 3 && normalizedTitle.includes(normalizedArtist);
     });
+  }
+
+  extractCoreTitle(title, artists) {
+    const cleaned = String(title || "").replace(/\s+/g, " ").trim();
+    const segments = cleaned.split(/\s*[-|:]\s*/).map((segment) => segment.trim()).filter(Boolean);
+    const candidates = [...new Set([cleaned, ...segments])];
+    let best = "";
+    let bestScore = -Infinity;
+
+    for (const candidate of candidates) {
+      const stripped = this.stripTitleDecorators(this.stripArtistMentions(candidate, artists));
+      const normalized = this.normalizeText(stripped);
+
+      if (!normalized) {
+        continue;
+      }
+
+      const tokens = this.tokenizeTitle(stripped);
+      const score =
+        tokens.size * 12 +
+        Math.min(normalized.length, 32) -
+        this.countArtistMentions(candidate, artists) * 20 -
+        (this.hasTitleDescriptor(candidate) ? 15 : 0);
+
+      if (score > bestScore) {
+        best = stripped;
+        bestScore = score;
+      }
+    }
+
+    const fallback = this.stripTitleDecorators(this.stripArtistMentions(cleaned, artists));
+    return best || fallback || cleaned;
+  }
+
+  stripArtistMentions(value, artists) {
+    let output = String(value || "");
+
+    for (const artist of this.normalizeArtistNames(artists)) {
+      const pattern = this.escapeRegExp(artist);
+      if (!pattern) {
+        continue;
+      }
+
+      output = output.replace(new RegExp(pattern, "ig"), " ");
+    }
+
+    return output.replace(/\s+/g, " ").trim();
+  }
+
+  stripTitleDecorators(value) {
+    return String(value || "")
+      .replace(/\b(?:feat(?:uring)?|ft\.?)\b.*$/i, " ")
+      .replace(/\bprod(?:\.|uced)?\s*(?:by)?\b.*$/i, " ")
+      .replace(/\b(?:official|audio|video|visualizer|lyrics?|lyric|topic)\b.*$/i, " ")
+      .replace(/[@#][\w-]+/g, " ")
+      .replace(/[()[\]{}]/g, " ")
+      .replace(/\b(?:and|with|x)\b\s*$/i, " ")
+      .replace(/[&/|,:-]+\s*$/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  hasTitleDescriptor(value) {
+    return /\b(?:feat(?:uring)?|ft\.?|prod(?:\.|uced)?|official|audio|video|visualizer|lyrics?|lyric|topic)\b/i
+      .test(String(value || ""));
+  }
+
+  countArtistMentions(title, artists) {
+    const normalizedTitle = this.normalizeText(title);
+    let count = 0;
+
+    for (const artist of this.normalizeArtistNames(artists)) {
+      const normalizedArtist = this.normalizeText(this.cleanArtist(artist));
+      if (normalizedArtist && normalizedTitle.includes(normalizedArtist)) {
+        count += 1;
+      }
+    }
+
+    return count;
+  }
+
+  isDuplicateProfileInCollection(profile, profiles) {
+    return Array.isArray(profiles) && profiles.some((existing) => this.isDuplicateProfile(profile, existing));
+  }
+
+  isDuplicateProfile(left, right) {
+    if (!left?.normalizedCoreTitle || !right?.normalizedCoreTitle) {
+      return false;
+    }
+
+    const sameCoreTitle =
+      left.normalizedCoreTitle === right.normalizedCoreTitle ||
+      this.isSameTitleVariant(left.normalizedCoreTitle, new Set([right.normalizedCoreTitle]));
+
+    const sharedCoreTokens = this.countSharedValues(left.coreTitleTokens, right.coreTitleTokens);
+    const minimumCoreTokens = Math.min(left.coreTitleTokens.size, right.coreTitleTokens.size);
+    const coreTokensEquivalent = minimumCoreTokens >= 2 && sharedCoreTokens === minimumCoreTokens;
+
+    if (!sameCoreTitle && !coreTokensEquivalent) {
+      return false;
+    }
+
+    if (this.haveArtistOverlap(left.normalizedArtists, right.normalizedArtists)) {
+      return true;
+    }
+
+    if (
+      this.titleMentionsArtists(left.rawTitle, right.artistNames) ||
+      this.titleMentionsArtists(right.rawTitle, left.artistNames)
+    ) {
+      return true;
+    }
+
+    return this.isDistinctiveTitleProfile(left) && this.isDistinctiveTitleProfile(right);
+  }
+
+  haveArtistOverlap(left, right) {
+    return this.countSharedValues(left, right) > 0;
+  }
+
+  isDistinctiveTitleProfile(profile) {
+    return profile.coreTitleTokens.size >= 2 || profile.normalizedCoreTitle.length >= 10;
   }
 
   normalizeSource(value) {
@@ -893,6 +1062,10 @@ class AutoplayService {
   normalizeStrictArtistTrackCount(value) {
     const numeric = Number(value);
     return Number.isFinite(numeric) && numeric > 0 ? Math.max(1, Math.floor(numeric)) : STRICT_SEED_ARTIST_TRACK_COUNT;
+  }
+
+  escapeRegExp(value) {
+    return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
 }
 
