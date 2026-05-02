@@ -310,6 +310,10 @@ class PlayerManager {
     const exclusions = this.getAutoplayExclusions(state, sourceTrack);
     const track = await this.client.music.resolveAutoplayTrack(sourceTrack, requester, exclusions);
 
+    if (this.getState(state.guildId) !== state || state.isDestroying) {
+      return null;
+    }
+
     if (!state.autoplayEnabled || state.queue.length > 0) {
       return null;
     }

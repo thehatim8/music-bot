@@ -9,6 +9,7 @@ from ytmusicapi import YTMusic
 WATCH_LIMIT = 40
 MAX_RESULTS = 25
 SEARCH_LIMIT = 12
+ARTIST_SEARCH_LIMIT = 18
 
 ytmusic = YTMusic()
 
@@ -161,6 +162,13 @@ def artist_tracks(artist_id):
     return tracks
 
 
+def search_song_results(query, limit=SEARCH_LIMIT):
+    try:
+        return ytmusic.search(query, filter="songs", limit=limit) or []
+    except Exception:
+        return []
+
+
 def get_recommendations(video_id):
     seen = set()
     output = []
@@ -168,6 +176,8 @@ def get_recommendations(video_id):
     watch_tracks = watch.get("tracks") or []
     seed_track = next((item for item in watch_tracks if item.get("videoId") == video_id), None)
     seed_track = seed_track or (watch_tracks[0] if watch_tracks else {})
+    seed_artists = artist_entries(seed_track)
+    seed_artist_name = seed_artists[0]["name"] if seed_artists else ""
     seed_artist_ids = list(dict.fromkeys(artist_ids(seed_track)))
     related = related_tracks(related_browse_id(watch))
 
@@ -182,6 +192,11 @@ def get_recommendations(video_id):
         if len(output) >= MAX_RESULTS:
             return output[:MAX_RESULTS]
 
+    if seed_artist_name:
+        add_tracks(output, seen, search_song_results(f"{seed_artist_name} songs", ARTIST_SEARCH_LIMIT), "artist")
+        if len(output) >= MAX_RESULTS:
+            return output[:MAX_RESULTS]
+
     add_tracks(output, seen, related, "related", predicate=same_artist)
     add_tracks(output, seen, watch_tracks, "watch")
     add_tracks(output, seen, related, "related")
@@ -189,7 +204,7 @@ def get_recommendations(video_id):
 
 
 def get_search_results(query):
-    results = ytmusic.search(query, filter="songs", limit=SEARCH_LIMIT)
+    results = search_song_results(query, SEARCH_LIMIT)
     output = []
     seen = set()
     add_tracks(output, seen, results, "search")

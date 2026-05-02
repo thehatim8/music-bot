@@ -1,6 +1,8 @@
 const DEFAULT_YTMUSIC_AUTOPLAY_URL = "http://127.0.0.1:3001";
 const REQUEST_TIMEOUT_MS = 3000;
 const MAX_CANDIDATES_TO_TRY = 15;
+const STRICT_SEED_ARTIST_TRACK_COUNT = 6;
+const MIN_RELEVANCE_SCORE = 70;
 
 const SOURCE_SCORES = Object.freeze({
   artist: 90,
@@ -130,10 +132,15 @@ class AutoplayService {
       return null;
     }
 
-    const ordered = this.rankTracks(filtered, context).slice(0, MAX_CANDIDATES_TO_TRY);
+    const ranked = this.rankTracks(filtered, context);
+    const ordered = this.selectCandidateBatch(ranked, context, options).slice(0, MAX_CANDIDATES_TO_TRY);
 
-    for (const candidate of ordered) {
-      const track = await this.resolveCandidate(candidate, requester, context, options).catch(() => null);
+    if (ordered.length === 0) {
+      return null;
+    }
+
+    for (const entry of ordered) {
+      const track = await this.resolveCandidate(entry.track, requester, context, options).catch(() => null);
       if (track) {
         return track;
       }
@@ -183,29 +190,26 @@ class AutoplayService {
       .map((track, index) => ({
         track,
         index,
+        signals: this.buildCandidateSignals(track, context),
         score: this.scoreTrack(track, context)
       }))
-      .sort((left, right) => right.score - left.score || left.index - right.index)
-      .map((entry) => entry.track);
+      .sort((left, right) => right.score - left.score || left.index - right.index);
   }
 
   scoreTrack(track, context) {
-    const profile = this.buildProfile(track.title, this.getArtistNames(track));
-    const sharedSeedArtists = this.countSharedValues(profile.normalizedArtists, context.seedProfile.normalizedArtists);
-    const sharedCurrentArtists = this.countSharedValues(profile.normalizedArtists, context.currentProfile.normalizedArtists);
-    const seedTitleOverlap = this.countSharedValues(profile.titleTokens, context.seedProfile.titleTokens);
-    const currentTitleOverlap = this.countSharedValues(profile.titleTokens, context.currentProfile.titleTokens);
+    const signals = this.buildCandidateSignals(track, context);
+    const { profile, sharedSeedArtists, sharedCurrentArtists, seedTitleOverlap, currentTitleOverlap } = signals;
 
     let score = this.getSourceScore(track.source);
 
-    if (sharedSeedArtists > 0) {
-      score += 220 + sharedSeedArtists * 50;
+    if (signals.seedArtistMatch) {
+      score += 220 + Math.max(sharedSeedArtists, 1) * 50;
     } else if (context.seedProfile.normalizedArtists.size > 0) {
       score -= 110;
     }
 
-    if (sharedCurrentArtists > 0) {
-      score += 140 + sharedCurrentArtists * 40;
+    if (signals.currentArtistMatch) {
+      score += 140 + Math.max(sharedCurrentArtists, 1) * 40;
     } else if (context.currentProfile.normalizedArtists.size > 0) {
       score -= 30;
     }
@@ -230,6 +234,51 @@ class AutoplayService {
     }
 
     return score;
+  }
+
+  buildCandidateSignals(track, context) {
+    const profile = this.buildProfile(track.title, this.getArtistNames(track));
+    const sharedSeedArtists = this.countSharedValues(profile.normalizedArtists, context.seedProfile.normalizedArtists);
+    const sharedCurrentArtists = this.countSharedValues(profile.normalizedArtists, context.currentProfile.normalizedArtists);
+    const seedTitleOverlap = this.countSharedValues(profile.titleTokens, context.seedProfile.titleTokens);
+    const currentTitleOverlap = this.countSharedValues(profile.titleTokens, context.currentProfile.titleTokens);
+
+    return {
+      profile,
+      sharedSeedArtists,
+      sharedCurrentArtists,
+      seedTitleOverlap,
+      currentTitleOverlap,
+      seedArtistMatch:
+        sharedSeedArtists > 0 || this.titleMentionsArtists(profile.rawTitle, context.seedProfile.artistNames),
+      currentArtistMatch:
+        sharedCurrentArtists > 0 || this.titleMentionsArtists(profile.rawTitle, context.currentProfile.artistNames)
+    };
+  }
+
+  selectCandidateBatch(ranked, context, options = {}) {
+    const seedMatches = ranked.filter((entry) => entry.signals.seedArtistMatch);
+    const requireSeedArtist = context.requireSeedArtist && !options.ignoreSeedArtistLock;
+
+    if (requireSeedArtist) {
+      return seedMatches;
+    }
+
+    if (seedMatches.length > 0) {
+      return seedMatches;
+    }
+
+    const currentMatches = ranked.filter((entry) => entry.signals.currentArtistMatch);
+    if (currentMatches.length > 0) {
+      return currentMatches;
+    }
+
+    const relevant = ranked.filter((entry) => entry.score >= MIN_RELEVANCE_SCORE);
+    if (relevant.length > 0) {
+      return relevant;
+    }
+
+    return options.allowLowConfidence ? ranked : [];
   }
 
   async resolveCandidate(candidate, requester, context, options = {}) {
@@ -269,10 +318,12 @@ class AutoplayService {
       videoId: candidate.videoId,
       source,
       bucket: candidate.source || "related",
+      chainDepth: context.nextChainDepth,
       seed: {
         videoId: context.seedData.videoId,
         title: context.seedData.title,
-        artists: [...context.seedData.artists]
+        artists: [...context.seedData.artists],
+        strictArtistTrackCount: context.seedData.strictArtistTrackCount
       },
       candidate: {
         videoId: candidate.videoId,
@@ -285,15 +336,43 @@ class AutoplayService {
   }
 
   async resolveFallback(requester, context) {
-    const queries = this.buildFallbackQueries(context);
+    const strictQueries = this.buildFallbackQueries(context, { broaden: false });
+    const strictTrack =
+      (await this.resolveFallbackQueries(strictQueries, requester, context, { allowLowConfidence: false })) ||
+      (await this.resolveLavalinkFallback(strictQueries, requester, context, { allowLowConfidence: false }));
 
+    if (strictTrack) {
+      return strictTrack;
+    }
+
+    const relaxedQueries = this.buildFallbackQueries(context, { broaden: true });
+    const relaxedTrack =
+      (await this.resolveFallbackQueries(relaxedQueries, requester, context, {
+        allowLowConfidence: false,
+        ignoreSeedArtistLock: true
+      })) ||
+      (await this.resolveLavalinkFallback(relaxedQueries, requester, context, {
+        allowLowConfidence: true,
+        ignoreSeedArtistLock: true
+      }));
+
+    if (relaxedTrack) {
+      return relaxedTrack;
+    }
+
+    throw new Error("I could not find a relevant song for autoplay.");
+  }
+
+  async resolveFallbackQueries(queries, requester, context, options = {}) {
     for (const query of queries) {
       const track = await this.fetchSearch(query)
         .then((tracks) =>
           this.resolveCandidateList(tracks, requester, context, {
             sourceLabel: "Autoplay",
             decorateAutoplay: true,
-            autoplaySource: "ytmusic"
+            autoplaySource: "ytmusic",
+            allowLowConfidence: options.allowLowConfidence,
+            ignoreSeedArtistLock: options.ignoreSeedArtistLock
           })
         )
         .catch(() => null);
@@ -303,17 +382,13 @@ class AutoplayService {
       }
     }
 
-    const lavalinkTrack = await this.resolveLavalinkFallback(queries, requester, context);
-    if (lavalinkTrack) {
-      return lavalinkTrack;
-    }
-
-    throw new Error("I could not find a relevant song for autoplay.");
+    return null;
   }
 
-  buildFallbackQueries(context) {
+  buildFallbackQueries(context, options = {}) {
     const queries = [];
     const seen = new Set();
+    const broaden = options.broaden === true;
 
     const addQuery = (value) => {
       const query = String(value || "").replace(/\s+/g, " ").trim();
@@ -332,23 +407,28 @@ class AutoplayService {
     const seedTitle = context.seedProfile.cleanedTitle;
     const currentTitle = context.currentProfile.cleanedTitle;
 
-    addQuery([seedArtist, currentTitle].filter(Boolean).join(" "));
-    addQuery([currentArtist, currentTitle].filter(Boolean).join(" "));
-    addQuery([seedArtist, seedTitle].filter(Boolean).join(" "));
-    addQuery([currentArtist, seedTitle].filter(Boolean).join(" "));
-
     if (seedArtist) {
+      addQuery([seedArtist, currentTitle].filter(Boolean).join(" "));
+      addQuery([seedArtist, seedTitle].filter(Boolean).join(" "));
+      addQuery(`${seedArtist} songs`);
       addQuery(`${seedArtist} popular songs`);
+      addQuery(`${seedArtist} official audio`);
     }
 
-    if (currentArtist && this.normalizeText(currentArtist) !== this.normalizeText(seedArtist)) {
-      addQuery(`${currentArtist} popular songs`);
+    if (broaden) {
+      addQuery([currentArtist, currentTitle].filter(Boolean).join(" "));
+      addQuery([currentArtist, seedTitle].filter(Boolean).join(" "));
+
+      if (currentArtist && this.normalizeText(currentArtist) !== this.normalizeText(seedArtist)) {
+        addQuery(`${currentArtist} songs`);
+        addQuery(`${currentArtist} popular songs`);
+      }
     }
 
-    return queries.slice(0, 6);
+    return queries.slice(0, broaden ? 10 : 6);
   }
 
-  async resolveLavalinkFallback(queries, requester, context) {
+  async resolveLavalinkFallback(queries, requester, context, options = {}) {
     const node = this.client.playerManager.getSearchNode();
 
     for (const query of queries) {
@@ -373,9 +453,11 @@ class AutoplayService {
           return !this.isBlockedTitle(candidate.title);
         });
 
-      const ordered = this.rankTracks(candidates, context).slice(0, MAX_CANDIDATES_TO_TRY);
+      const ordered = this.selectCandidateBatch(this.rankTracks(candidates, context), context, options)
+        .slice(0, MAX_CANDIDATES_TO_TRY);
 
-      for (const candidate of ordered) {
+      for (const entry of ordered) {
+        const candidate = entry.track;
         const queueTrack = this.music.createQueueTrack(candidate.rawTrack, requester, "Autoplay", {
           title: candidate.title,
           artists: this.getArtistNames(candidate)
@@ -396,6 +478,8 @@ class AutoplayService {
     const currentProfile = this.getTrackProfile(referenceTrack);
     const seedData = this.getSeedData(referenceTrack, currentProfile);
     const seedProfile = this.buildProfile(seedData.title, seedData.artists);
+    const chainDepth = this.getAutoplayChainDepth(referenceTrack);
+    const nextChainDepth = chainDepth + 1;
 
     for (const track of tracks.slice(-20)) {
       const videoId = this.getVideoId(track);
@@ -422,7 +506,10 @@ class AutoplayService {
       fingerprints,
       currentProfile,
       seedProfile,
-      seedData
+      seedData,
+      chainDepth,
+      nextChainDepth,
+      requireSeedArtist: nextChainDepth <= seedData.strictArtistTrackCount
     };
   }
 
@@ -440,8 +527,12 @@ class AutoplayService {
       seedData: {
         videoId: null,
         title: profile.cleanedTitle,
-        artists: profile.artistNames
-      }
+        artists: profile.artistNames,
+        strictArtistTrackCount: STRICT_SEED_ARTIST_TRACK_COUNT
+      },
+      chainDepth: 0,
+      nextChainDepth: 1,
+      requireSeedArtist: false
     };
   }
 
@@ -471,14 +562,16 @@ class AutoplayService {
       return {
         videoId: this.cleanVideoId(seed.videoId) || this.getVideoId(referenceTrack),
         title: String(seed.title || currentProfile.cleanedTitle || currentProfile.rawTitle || "").trim(),
-        artists: this.normalizeArtistNames(seed.artists)
+        artists: this.normalizeArtistNames(seed.artists),
+        strictArtistTrackCount: this.normalizeStrictArtistTrackCount(seed.strictArtistTrackCount)
       };
     }
 
     return {
       videoId: this.getVideoId(referenceTrack),
       title: currentProfile.cleanedTitle || currentProfile.rawTitle,
-      artists: [...currentProfile.artistNames]
+      artists: [...currentProfile.artistNames],
+      strictArtistTrackCount: STRICT_SEED_ARTIST_TRACK_COUNT
     };
   }
 
@@ -658,6 +751,19 @@ class AutoplayService {
       .filter(Boolean)];
   }
 
+  titleMentionsArtists(title, artists) {
+    const normalizedTitle = this.normalizeText(title);
+
+    if (!normalizedTitle) {
+      return false;
+    }
+
+    return this.normalizeArtistNames(artists).some((artist) => {
+      const normalizedArtist = this.normalizeText(this.cleanArtist(artist));
+      return normalizedArtist.length >= 3 && normalizedTitle.includes(normalizedArtist);
+    });
+  }
+
   normalizeSource(value) {
     const source = String(value || "").trim().toLowerCase();
     return SOURCE_SCORES[source] ? source : "related";
@@ -723,6 +829,11 @@ class AutoplayService {
     return this.cleanVideoId(track?.info?.identifier) || this.extractVideoId(track?.info?.uri);
   }
 
+  getAutoplayChainDepth(track) {
+    const value = Number(track?.autoplay?.chainDepth);
+    return Number.isFinite(value) && value >= 0 ? value : 0;
+  }
+
   cleanVideoId(value) {
     const text = String(value || "").trim();
     return /^[a-zA-Z0-9_-]{11}$/.test(text) ? text : null;
@@ -777,6 +888,11 @@ class AutoplayService {
 
   normalizeServiceUrl(value) {
     return String(value || DEFAULT_YTMUSIC_AUTOPLAY_URL).replace("://localhost", "://127.0.0.1");
+  }
+
+  normalizeStrictArtistTrackCount(value) {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) && numeric > 0 ? Math.max(1, Math.floor(numeric)) : STRICT_SEED_ARTIST_TRACK_COUNT;
   }
 }
 
