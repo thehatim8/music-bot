@@ -3,6 +3,13 @@ const REQUEST_TIMEOUT_MS = 3000;
 const MAX_CANDIDATES_TO_TRY = 15;
 const STRICT_SEED_ARTIST_TRACK_COUNT = 6;
 const MIN_RELEVANCE_SCORE = 70;
+// Floor applied to the relaxed "low confidence" fallback so it can never queue a
+// totally unrelated result (e.g. a score-20 random search hit) just to keep playing.
+const LOW_CONFIDENCE_MIN_SCORE = 30;
+// Music sanity bounds used to reject non-song results that raw YouTube search can
+// surface (hour-long mixes, compilations, podcasts, livestreams, tiny clips).
+const MIN_TRACK_DURATION_MS = 30 * 1000;
+const MAX_TRACK_DURATION_MS = 15 * 60 * 1000;
 
 const SOURCE_SCORES = Object.freeze({
   artist: 90,
@@ -291,14 +298,19 @@ class AutoplayService {
       return relevant;
     }
 
-    return options.allowLowConfidence ? ranked : [];
+    // Even when we allow a low-confidence pick to keep the radio going, never queue a
+    // result that has no real connection to the seed/current track. The scorer drives
+    // unrelated candidates strongly negative, so this floor keeps us on actual music.
+    return options.allowLowConfidence
+      ? ranked.filter((entry) => entry.score >= LOW_CONFIDENCE_MIN_SCORE)
+      : [];
   }
 
   async resolveCandidate(candidate, requester, context, options = {}) {
     const node = this.client.playerManager.getSearchNode();
     const result = await node.rest.resolve(`https://www.youtube.com/watch?v=${candidate.videoId}`);
     const rawTrack = this.music.getLavalinkTracks(result).find((track) => {
-      if (!track?.encoded) {
+      if (!track?.encoded || !this.isPlayableMusicTrack(track)) {
         return false;
       }
 
@@ -709,7 +721,7 @@ class AutoplayService {
   }
 
   normalizeLavalinkTrack(rawTrack) {
-    if (!rawTrack?.encoded || !rawTrack.info?.title) {
+    if (!rawTrack?.encoded || !rawTrack.info?.title || !this.isPlayableMusicTrack(rawTrack)) {
       return null;
     }
 
@@ -1101,6 +1113,29 @@ class AutoplayService {
   isBlockedTitle(title) {
     const value = String(title || "").toLowerCase();
     return BANNED_WORDS.some((word) => value.includes(word));
+  }
+
+  isPlayableMusicTrack(rawTrack) {
+    const info = rawTrack?.info;
+    if (!info) {
+      return false;
+    }
+
+    // Livestreams are never songs.
+    if (info.isStream) {
+      return false;
+    }
+
+    const length = Number(info.length);
+
+    // Length unknown -> trust it (YouTube Music results always carry one; this only
+    // affects edge cases). Otherwise reject clips/intros and hour-long mixes,
+    // compilations, podcasts and "full album" uploads that raw search surfaces.
+    if (!Number.isFinite(length) || length <= 0) {
+      return true;
+    }
+
+    return length >= MIN_TRACK_DURATION_MS && length <= MAX_TRACK_DURATION_MS;
   }
 
   isSameTitleVariant(title, currentTitles) {
