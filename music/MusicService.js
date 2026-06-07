@@ -71,22 +71,48 @@ class MusicService {
     }
 
     if (!this.isUrl(query)) {
-      const ytmusicTrack = await this.autoplay.resolveYouTubeMusicSearch(query, requester).catch((error) => {
-        console.warn(`YouTube Music search resolver failed: ${error.message}`);
-        return null;
-      });
-
-      if (ytmusicTrack) {
-        return {
-          type: "track",
-          source: "ytmusic",
-          title: ytmusicTrack.info.title,
-          tracks: [ytmusicTrack]
-        };
-      }
+      return this.resolveTextQuery(query, requester);
     }
 
     return this.resolveLavalink(query, requester, { allowPlaylists, sourceLabel: options.sourceLabel });
+  }
+
+  // Free-text searches (e.g. `/play random stuff`) must only ever produce real
+  // songs. We identify the song on Spotify first, then use YouTube purely as the
+  // audio source. If Spotify has no match we fall back to YouTube Music's
+  // songs-only catalog — never raw YouTube video search, which returns any video.
+  async resolveTextQuery(query, requester) {
+    const spotifyMatch = await this.spotify.searchTrack(query).catch((error) => {
+      console.warn(`Spotify search failed: ${error.message}`);
+      return null;
+    });
+
+    if (spotifyMatch) {
+      const resolved = await this.resolveCanonicalSpotifyTrack(spotifyMatch, requester).catch((error) => {
+        console.warn(`Failed to resolve audio for Spotify match "${spotifyMatch.name}": ${error.message}`);
+        return null;
+      });
+
+      if (resolved) {
+        return resolved;
+      }
+    }
+
+    const ytmusicTrack = await this.autoplay.resolveYouTubeMusicSearch(query, requester).catch((error) => {
+      console.warn(`YouTube Music search resolver failed: ${error.message}`);
+      return null;
+    });
+
+    if (ytmusicTrack) {
+      return {
+        type: "track",
+        source: "ytmusic",
+        title: ytmusicTrack.info.title,
+        tracks: [ytmusicTrack]
+      };
+    }
+
+    throw new Error(`I couldn't find a song matching "${query}". Try a more specific song or artist name.`);
   }
 
   async resolveStoredTrack(song, requester) {
@@ -128,6 +154,13 @@ class MusicService {
 
   async resolveSpotifyTrack(url, requester) {
     const track = await this.spotify.getTrack(url);
+    return this.resolveCanonicalSpotifyTrack(track, requester);
+  }
+
+  // Given an identified Spotify track, find its playable audio on YouTube and
+  // tag it with the canonical Spotify title/artists. Shared by direct Spotify
+  // URLs and by text searches resolved through Spotify.
+  async resolveCanonicalSpotifyTrack(track, requester) {
     const resolved = await this.resolveLavalink(track.searchQuery, requester, { allowPlaylists: false, sourceLabel: "Spotify" });
     const firstTrack = resolved.tracks[0];
 

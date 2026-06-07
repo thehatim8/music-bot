@@ -2,6 +2,7 @@ class SpotifyService {
   constructor(config) {
     this.clientId = config.spotify.clientId;
     this.clientSecret = config.spotify.clientSecret;
+    this.market = config.spotify.market || null;
     this.cachedToken = null;
     this.tokenExpiresAt = 0;
   }
@@ -85,6 +86,18 @@ class SpotifyService {
     return `${artists} - ${track.name} official audio`;
   }
 
+  normalizeTrack(track) {
+    return {
+      id: track.id,
+      name: track.name,
+      artists: track.artists.map((artist) => ({ name: artist.name })),
+      duration: track.duration_ms,
+      url: track.external_urls?.spotify || null,
+      artworkUrl: track.album?.images?.[0]?.url || null,
+      searchQuery: this.buildSearchQuery(track)
+    };
+  }
+
   async getTrack(url) {
     const parsed = this.parseSpotifyUrl(url);
 
@@ -93,16 +106,29 @@ class SpotifyService {
     }
 
     const track = await this.request(`/tracks/${parsed.id}`);
+    return this.normalizeTrack(track);
+  }
 
-    return {
-      id: track.id,
-      name: track.name,
-      artists: track.artists.map((artist) => ({ name: artist.name })),
-      duration: track.duration_ms,
-      url: track.external_urls.spotify,
-      artworkUrl: track.album?.images?.[0]?.url || null,
-      searchQuery: this.buildSearchQuery(track)
-    };
+  // Resolves a free-text query to the closest matching Spotify song. This is what
+  // lets the bot play only real songs: instead of searching YouTube directly (which
+  // returns any video), we first identify the actual track on Spotify.
+  async searchTrack(query) {
+    const term = String(query || "").trim();
+
+    if (!term) {
+      return null;
+    }
+
+    const params = new URLSearchParams({ q: term, type: "track", limit: "1" });
+
+    if (this.market) {
+      params.set("market", this.market);
+    }
+
+    const data = await this.request(`/search?${params.toString()}`);
+    const track = data.tracks?.items?.find((item) => item && item.id);
+
+    return track ? this.normalizeTrack(track) : null;
   }
 
   async getPlaylist(url) {
