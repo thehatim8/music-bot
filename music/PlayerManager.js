@@ -6,6 +6,8 @@ const { shuffleArray } = require("../utils/formatters");
 
 const START_TIMEOUT_NOTICE_THROTTLE_MS = 30000;
 const PLAYBACK_START_POSITION_GRACE_MS = 1000;
+const NODE_RECONNECT_BASE_DELAY_MS = 5000;
+const NODE_RECONNECT_MAX_DELAY_MS = 30000;
 const NEUTRAL_AUDIO_FILTERS = Object.freeze({
   volume: 1,
   equalizer: [],
@@ -24,28 +26,32 @@ class PlayerManager {
     this.client = client;
     this.config = config;
     this.states = new Map();
+    this.nodeOptions = {
+      name: "main",
+      url: `${config.lavalink.host}:${config.lavalink.port}`,
+      auth: config.lavalink.password
+    };
+    this.isShuttingDown = false;
+    this.nodeReconnectTimer = null;
+    this.nodeReconnectAttempts = 0;
     this.shoukaku = new Shoukaku(
       new Connectors.DiscordJS(client),
-      [
-        {
-          name: "main",
-          url: `${config.lavalink.host}:${config.lavalink.port}`,
-          auth: config.lavalink.password
-        }
-      ],
+      [this.nodeOptions],
       {
         moveOnDisconnect: false,
-        reconnectTries: 3,
+        reconnectTries: 5,
         reconnectInterval: 5,
         restTimeout: 60,
-        resume: false,
-        resumeByLibrary: false,
-        resumeTimeout: 0,
+        resume: true,
+        resumeByLibrary: true,
+        resumeTimeout: 30,
         voiceConnectionTimeout: 30
       }
     );
 
     this.shoukaku.on("ready", (name) => {
+      this.nodeReconnectAttempts = 0;
+      this.clearNodeReconnectTimer();
       console.log(`Lavalink node ready: ${name}`);
     });
 
@@ -53,9 +59,53 @@ class PlayerManager {
       console.error(`Lavalink node error (${name}):`, error);
     });
 
-    this.shoukaku.on("disconnect", (name, reconnectsLeft) => {
-      console.warn(`Lavalink node disconnected: ${name}. Reconnects left: ${reconnectsLeft}`);
+    this.shoukaku.on("disconnect", (name, count) => {
+      console.warn(`Lavalink node disconnected: ${name}. Affected players: ${count}.`);
+      // Shoukaku removes the node from its pool once reconnect tries are exhausted,
+      // which leaves getIdealNode() returning nothing until the process restarts.
+      // Re-add the node ourselves so playback can recover without a manual restart.
+      this.scheduleNodeReconnect();
     });
+  }
+
+  clearNodeReconnectTimer() {
+    if (this.nodeReconnectTimer) {
+      clearTimeout(this.nodeReconnectTimer);
+      this.nodeReconnectTimer = null;
+    }
+  }
+
+  scheduleNodeReconnect() {
+    if (this.isShuttingDown || this.nodeReconnectTimer) {
+      return;
+    }
+
+    const attempt = ++this.nodeReconnectAttempts;
+    const delay = Math.min(NODE_RECONNECT_BASE_DELAY_MS * attempt, NODE_RECONNECT_MAX_DELAY_MS);
+    console.warn(`Scheduling Lavalink node reconnect in ${delay}ms (attempt ${attempt}).`);
+
+    this.nodeReconnectTimer = setTimeout(() => {
+      this.nodeReconnectTimer = null;
+
+      if (this.isShuttingDown) {
+        return;
+      }
+
+      // If the node found its way back into the pool on its own, there's nothing to do.
+      if (this.shoukaku.nodes.has(this.nodeOptions.name)) {
+        this.nodeReconnectAttempts = 0;
+        return;
+      }
+
+      try {
+        this.shoukaku.addNode(this.nodeOptions);
+        console.log("Re-adding Lavalink node; attempting to reconnect...");
+      } catch (error) {
+        console.error("Failed to re-add Lavalink node:", error);
+        // Keep trying — the next attempt uses a longer backoff.
+        this.scheduleNodeReconnect();
+      }
+    }, delay);
   }
 
   getSearchNode() {
@@ -700,6 +750,9 @@ class PlayerManager {
   }
 
   async destroyAll(reason) {
+    this.isShuttingDown = true;
+    this.clearNodeReconnectTimer();
+
     const guildIds = [...this.states.keys()];
 
     for (const guildId of guildIds) {
