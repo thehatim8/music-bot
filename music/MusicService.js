@@ -140,10 +140,19 @@ class MusicService {
       return null;
     }
 
-    const playable = tracks.find(
-      (track) => this.autoplay.isPlayableMusicTrack(track) && !this.autoplay.isBlockedTitle(track.info?.title)
+    // Raw YouTube search returns a video for any text, so only accept a result that
+    // is a real song AND whose title/artist actually matches the words searched for.
+    // Without this, nonsense queries quietly play an unrelated song.
+    const chosen = tracks.find(
+      (track) =>
+        this.autoplay.isPlayableMusicTrack(track) &&
+        !this.autoplay.isBlockedTitle(track.info?.title) &&
+        this.autoplay.isQueryRelevant(query, track.info?.title, track.info?.author)
     );
-    const chosen = playable || tracks[0];
+
+    if (!chosen) {
+      return null;
+    }
 
     return {
       type: "track",

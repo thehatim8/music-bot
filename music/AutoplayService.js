@@ -132,9 +132,13 @@ class AutoplayService {
     // A direct user search has no seed/current artist to match against, so the
     // autoplay relevance ranking (which requires a seed-artist match or a high
     // relevance score) would reject every result. The YouTube Music search endpoint
-    // already returns songs in relevance order, so here we simply take the first
-    // playable, non-blocked result instead of running it through that gate.
-    const candidates = this.filterTracks(tracks, context).slice(0, MAX_CANDIDATES_TO_TRY);
+    // already returns songs in relevance order, so here we take the first playable,
+    // non-blocked result whose title/artist actually matches the words searched for.
+    // The relevance gate keeps nonsense queries (e.g. "random shit ass") from quietly
+    // playing an unrelated song instead of reporting "no match".
+    const candidates = this.filterTracks(tracks, context)
+      .filter((candidate) => this.isQueryRelevant(query, candidate.title, candidate.artist))
+      .slice(0, MAX_CANDIDATES_TO_TRY);
 
     for (const candidate of candidates) {
       const track = await this.resolveCandidate(candidate, requester, context, {
@@ -1130,6 +1134,31 @@ class AutoplayService {
   isBlockedTitle(title) {
     const value = String(title || "").toLowerCase();
     return BANNED_WORDS.some((word) => value.includes(word));
+  }
+
+  // Guards the free-text fallbacks: a raw search always returns *some* video, so we
+  // only accept a result when its title/artist actually shares the searched words.
+  // Requires at least half of the query's meaningful tokens to appear (min one); for
+  // very short queries with no usable tokens we fall back to direct containment.
+  isQueryRelevant(query, title, author = "") {
+    const normalizedQuery = this.normalizeText(query);
+    if (!normalizedQuery) {
+      return false;
+    }
+
+    const haystack = this.normalizeText(`${title || ""} ${author || ""}`);
+    if (!haystack) {
+      return false;
+    }
+
+    const queryTokens = this.tokenizeTitle(query);
+    if (queryTokens.size === 0) {
+      return haystack.includes(normalizedQuery) || normalizedQuery.includes(haystack);
+    }
+
+    const resultTokens = this.tokenizeTitle(`${title || ""} ${author || ""}`);
+    const shared = this.countSharedValues(queryTokens, resultTokens);
+    return shared >= Math.max(1, Math.ceil(queryTokens.size / 2));
   }
 
   isPlayableMusicTrack(rawTrack) {
