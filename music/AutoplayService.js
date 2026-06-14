@@ -127,10 +127,27 @@ class AutoplayService {
       return [];
     });
 
-    return this.resolveCandidateList(tracks, requester, this.buildSearchContext(query), {
-      sourceLabel: "YouTube Music",
-      decorateAutoplay: false
-    });
+    const context = this.buildSearchContext(query);
+
+    // A direct user search has no seed/current artist to match against, so the
+    // autoplay relevance ranking (which requires a seed-artist match or a high
+    // relevance score) would reject every result. The YouTube Music search endpoint
+    // already returns songs in relevance order, so here we simply take the first
+    // playable, non-blocked result instead of running it through that gate.
+    const candidates = this.filterTracks(tracks, context).slice(0, MAX_CANDIDATES_TO_TRY);
+
+    for (const candidate of candidates) {
+      const track = await this.resolveCandidate(candidate, requester, context, {
+        sourceLabel: "YouTube Music",
+        decorateAutoplay: false
+      }).catch(() => null);
+
+      if (track) {
+        return track;
+      }
+    }
+
+    return null;
   }
 
   async resolveCandidateList(tracks, requester, context, options = {}) {

@@ -112,7 +112,45 @@ class MusicService {
       };
     }
 
+    // Last resort: search Lavalink directly. We still keep this honest by picking
+    // the first result that passes the song sanity checks (real song length, not a
+    // live/lyric/mix upload) so we never queue a random hour-long video, but unlike
+    // the autoplay path we don't require a seed artist — this is a direct search.
+    const lavalinkTrack = await this.resolveDirectSearch(query, requester).catch((error) => {
+      console.warn(`Direct Lavalink search failed: ${error.message}`);
+      return null;
+    });
+
+    if (lavalinkTrack) {
+      return lavalinkTrack;
+    }
+
     throw new Error(`I couldn't find a song matching "${query}". Try a more specific song or artist name.`);
+  }
+
+  // Direct Lavalink fallback for free-text searches. Filters the raw search results
+  // down to playable songs (using the same sanity checks as autoplay) and returns the
+  // top match, falling back to the first encoded track if none pass the filter.
+  async resolveDirectSearch(query, requester) {
+    const node = this.client.playerManager.getSearchNode();
+    const result = await node.rest.resolve(`ytsearch:${query}`).catch(() => null);
+    const tracks = this.getLavalinkTracks(result).filter((track) => track?.encoded);
+
+    if (tracks.length === 0) {
+      return null;
+    }
+
+    const playable = tracks.find(
+      (track) => this.autoplay.isPlayableMusicTrack(track) && !this.autoplay.isBlockedTitle(track.info?.title)
+    );
+    const chosen = playable || tracks[0];
+
+    return {
+      type: "track",
+      source: "youtube",
+      title: chosen.info.title,
+      tracks: [this.createQueueTrack(chosen, requester, "YouTube")]
+    };
   }
 
   async resolveStoredTrack(song, requester) {
