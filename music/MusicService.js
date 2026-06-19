@@ -55,6 +55,13 @@ class MusicService {
   }
 
   async resolveInput(query, requester, options = {}) {
+    // Every resolution path (Spotify, direct URL, free-text) ultimately searches and
+    // loads its audio through Lavalink. Verify the audio backend is reachable up front
+    // so a missing or disconnected Lavalink node surfaces a clear, actionable error
+    // instead of being swallowed by the per-path catches and misreported to the user as
+    // "I couldn't find a song matching ...".
+    this.client.playerManager.getSearchNode();
+
     const allowPlaylists = options.allowPlaylists !== false;
     const spotifyTarget = this.spotify.parseSpotifyUrl(query);
 
@@ -82,14 +89,21 @@ class MusicService {
   // audio source. If Spotify has no match we fall back to YouTube Music's
   // songs-only catalog — never raw YouTube video search, which returns any video.
   async resolveTextQuery(query, requester) {
+    // Record why each source failed so that, when nothing resolves, we can tell the user
+    // the real reason (bad Spotify credentials, a YouTube load error / bot-check on the
+    // host, the autoplay service being down) instead of a misleading "no match".
+    const failures = [];
+
     const spotifyMatch = await this.spotify.searchTrack(query).catch((error) => {
       console.warn(`Spotify search failed: ${error.message}`);
+      failures.push(`Spotify search failed (${error.message})`);
       return null;
     });
 
     if (spotifyMatch) {
       const resolved = await this.resolveCanonicalSpotifyTrack(spotifyMatch, requester).catch((error) => {
         console.warn(`Failed to resolve audio for Spotify match "${spotifyMatch.name}": ${error.message}`);
+        failures.push(`Matched "${spotifyMatch.name}" on Spotify but could not load its audio (${error.message})`);
         return null;
       });
 
@@ -100,6 +114,7 @@ class MusicService {
 
     const ytmusicTrack = await this.autoplay.resolveYouTubeMusicSearch(query, requester).catch((error) => {
       console.warn(`YouTube Music search resolver failed: ${error.message}`);
+      failures.push(`YouTube Music search failed (${error.message})`);
       return null;
     });
 
@@ -118,11 +133,19 @@ class MusicService {
     // the autoplay path we don't require a seed artist — this is a direct search.
     const lavalinkTrack = await this.resolveDirectSearch(query, requester).catch((error) => {
       console.warn(`Direct Lavalink search failed: ${error.message}`);
+      failures.push(`Direct YouTube search failed (${error.message})`);
       return null;
     });
 
     if (lavalinkTrack) {
       return lavalinkTrack;
+    }
+
+    // Distinguish "every source errored out" (a credential/host/network problem) from a
+    // genuine "no match", so the user gets an actionable message instead of being told to
+    // pick a more specific song when the real issue is infrastructure.
+    if (failures.length > 0) {
+      throw new Error(`I couldn't play "${query}". Every source failed — ${failures.join("; ")}.`);
     }
 
     throw new Error(`I couldn't find a song matching "${query}". Try a more specific song or artist name.`);
@@ -133,7 +156,15 @@ class MusicService {
   // top match, falling back to the first encoded track if none pass the filter.
   async resolveDirectSearch(query, requester) {
     const node = this.client.playerManager.getSearchNode();
-    const result = await node.rest.resolve(`ytsearch:${query}`).catch(() => null);
+    // Don't swallow load failures: a YouTube error (e.g. a "confirm you're not a bot"
+    // block on the host) must surface to the caller rather than silently looking like
+    // "no results". Lavalink reports these as loadType "error" in the response body.
+    const result = await node.rest.resolve(`ytsearch:${query}`);
+
+    if (result?.loadType === "error") {
+      throw new Error(result.data?.message || "YouTube search returned an error.");
+    }
+
     const tracks = this.getLavalinkTracks(result).filter((track) => track?.encoded);
 
     if (tracks.length === 0) {
@@ -151,6 +182,9 @@ class MusicService {
     );
 
     if (!chosen) {
+      // Results came back but every one was filtered out as a non-song or off-topic
+      // match. Log it so an over-strict filter is visible in the host logs.
+      console.warn(`Direct search for "${query}" returned ${tracks.length} result(s), but none passed the song/relevance filters.`);
       return null;
     }
 

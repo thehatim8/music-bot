@@ -112,7 +112,10 @@ class PlayerManager {
     const node = this.shoukaku.getIdealNode();
 
     if (!node || node.state !== Constants.State.CONNECTED) {
-      throw new Error("No Lavalink node is currently connected. Make sure Lavalink is running first.");
+      throw new Error(
+        "No Lavalink node is currently connected, so I can't search for or play any audio. " +
+          "Start your Lavalink server and make sure LAVALINK_HOST, LAVALINK_PORT, and LAVALINK_PASSWORD in .env point to it."
+      );
     }
 
     return node;
