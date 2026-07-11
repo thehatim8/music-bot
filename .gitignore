@@ -1,1 +1,22 @@
+# Dependencies
+node_modules/
+
+# Secrets and local runtime state
 .env
+.bot.token
+.bot.lock
+
+# Lavalink runtime files (keep application.yml.example only)
+lavalink/application.yml
+lavalink/*.jar
+lavalink/plugins/
+lavalink/logs/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
