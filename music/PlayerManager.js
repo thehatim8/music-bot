@@ -6,8 +6,8 @@ const { shuffleArray } = require("../utils/formatters");
 
 const START_TIMEOUT_NOTICE_THROTTLE_MS = 30000;
 const PLAYBACK_START_POSITION_GRACE_MS = 1000;
-const NODE_RECONNECT_BASE_DELAY_MS = 5000;
-const NODE_RECONNECT_MAX_DELAY_MS = 30000;
+const NODE_WATCHDOG_INTERVAL_MS = 15000;
+const NODE_STUCK_RECYCLE_MS = 180000;
 const NEUTRAL_AUDIO_FILTERS = Object.freeze({
   volume: 1,
   equalizer: [],
@@ -32,8 +32,8 @@ class PlayerManager {
       auth: config.lavalink.password
     };
     this.isShuttingDown = false;
-    this.nodeReconnectTimer = null;
-    this.nodeReconnectAttempts = 0;
+    this.nodeWatchdogTimer = null;
+    this.nodeUnhealthySince = 0;
     this.shoukaku = new Shoukaku(
       new Connectors.DiscordJS(client),
       [this.nodeOptions],
@@ -50,8 +50,7 @@ class PlayerManager {
     );
 
     this.shoukaku.on("ready", (name) => {
-      this.nodeReconnectAttempts = 0;
-      this.clearNodeReconnectTimer();
+      this.nodeUnhealthySince = 0;
       console.log(`Lavalink node ready: ${name}`);
     });
 
@@ -59,62 +58,85 @@ class PlayerManager {
       console.error(`Lavalink node error (${name}):`, error);
     });
 
-    this.shoukaku.on("disconnect", (name, count) => {
-      console.warn(`Lavalink node disconnected: ${name}. Affected players: ${count}.`);
-      // Shoukaku removes the node from its pool once reconnect tries are exhausted,
-      // which leaves getIdealNode() returning nothing until the process restarts.
-      // Re-add the node ourselves so playback can recover without a manual restart.
-      this.scheduleNodeReconnect();
+    this.shoukaku.on("close", (name, code, reason) => {
+      console.warn(`Lavalink node connection closed (${name}): code=${code} reason=${reason || "none"}`);
     });
+
+    // Shoukaku 4.3.x silently deletes a node from its pool once its reconnect tries
+    // are exhausted and never emits a manager-level "disconnect" event, so an event
+    // handler can't restore it. Poll the pool instead and re-add the node whenever
+    // it goes missing, otherwise getIdealNode() returns nothing until a restart.
+    this.nodeWatchdogTimer = setInterval(() => this.ensureNodeConnection(), NODE_WATCHDOG_INTERVAL_MS);
+    this.nodeWatchdogTimer.unref?.();
   }
 
-  clearNodeReconnectTimer() {
-    if (this.nodeReconnectTimer) {
-      clearTimeout(this.nodeReconnectTimer);
-      this.nodeReconnectTimer = null;
+  stopNodeWatchdog() {
+    if (this.nodeWatchdogTimer) {
+      clearInterval(this.nodeWatchdogTimer);
+      this.nodeWatchdogTimer = null;
     }
   }
 
-  scheduleNodeReconnect() {
-    if (this.isShuttingDown || this.nodeReconnectTimer) {
+  ensureNodeConnection() {
+    // Before the Discord client is ready the connector hasn't added the node yet,
+    // and addNode would fail with "UserId missing".
+    if (this.isShuttingDown || !this.shoukaku.id) {
       return;
     }
 
-    const attempt = ++this.nodeReconnectAttempts;
-    const delay = Math.min(NODE_RECONNECT_BASE_DELAY_MS * attempt, NODE_RECONNECT_MAX_DELAY_MS);
-    console.warn(`Scheduling Lavalink node reconnect in ${delay}ms (attempt ${attempt}).`);
+    const node = this.shoukaku.nodes.get(this.nodeOptions.name);
 
-    this.nodeReconnectTimer = setTimeout(() => {
-      this.nodeReconnectTimer = null;
+    if (node && node.state === Constants.State.CONNECTED) {
+      this.nodeUnhealthySince = 0;
+      return;
+    }
 
-      if (this.isShuttingDown) {
-        return;
-      }
+    if (!this.nodeUnhealthySince) {
+      this.nodeUnhealthySince = Date.now();
+    }
 
-      // If the node found its way back into the pool on its own, there's nothing to do.
-      if (this.shoukaku.nodes.has(this.nodeOptions.name)) {
-        this.nodeReconnectAttempts = 0;
-        return;
-      }
-
+    if (!node) {
+      console.warn("Lavalink node is missing from the pool; re-adding it...");
       try {
         this.shoukaku.addNode(this.nodeOptions);
-        console.log("Re-adding Lavalink node; attempting to reconnect...");
       } catch (error) {
         console.error("Failed to re-add Lavalink node:", error);
-        // Keep trying — the next attempt uses a longer backoff.
-        this.scheduleNodeReconnect();
       }
-    }, delay);
+      return;
+    }
+
+    // The node is in the pool but has not reached CONNECTED for a long time
+    // (e.g. a websocket that opened but never got Lavalink's ready op).
+    // Nudge it through a fresh connect cycle; if that fails for good, Shoukaku
+    // drops it from the pool and the branch above re-adds it on the next tick.
+    if (Date.now() - this.nodeUnhealthySince >= NODE_STUCK_RECYCLE_MS) {
+      this.nodeUnhealthySince = Date.now();
+      console.warn(`Lavalink node stuck in state ${node.state}; forcing a reconnect cycle.`);
+
+      try {
+        if (node.state === Constants.State.CONNECTING) {
+          node.disconnect(1000, "Recycling stuck Lavalink connection");
+        } else {
+          node.connect().catch((error) => {
+            console.error("Failed to reconnect stuck Lavalink node:", error);
+          });
+        }
+      } catch (error) {
+        console.error("Failed to recycle stuck Lavalink node:", error);
+      }
+    }
   }
 
   getSearchNode() {
     const node = this.shoukaku.getIdealNode();
 
     if (!node || node.state !== Constants.State.CONNECTED) {
+      // Kick off recovery right away instead of waiting for the next watchdog tick.
+      this.ensureNodeConnection();
       throw new Error(
-        "No Lavalink node is currently connected, so I can't search for or play any audio. " +
-          "Start your Lavalink server and make sure LAVALINK_HOST, LAVALINK_PORT, and LAVALINK_PASSWORD in .env point to it."
+        "The Lavalink node is not connected right now, so I can't search for or play any audio. " +
+          "I'm reconnecting to it automatically — if the Lavalink server is running, try again in a few seconds. " +
+          "Otherwise start it and check LAVALINK_HOST, LAVALINK_PORT, and LAVALINK_PASSWORD in .env."
       );
     }
 
@@ -754,7 +776,7 @@ class PlayerManager {
 
   async destroyAll(reason) {
     this.isShuttingDown = true;
-    this.clearNodeReconnectTimer();
+    this.stopNodeWatchdog();
 
     const guildIds = [...this.states.keys()];
 
