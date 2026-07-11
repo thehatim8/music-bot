@@ -75,7 +75,9 @@ class SpotifyService {
 
     if (!response.ok) {
       const details = await response.text();
-      throw new Error(`Spotify API request failed (${response.status}): ${details}`);
+      const error = new Error(`Spotify API request failed (${response.status}): ${details}`);
+      error.status = response.status;
+      throw error;
     }
 
     return response.json();
@@ -138,7 +140,26 @@ class SpotifyService {
       throw new Error("That Spotify playlist URL is invalid.");
     }
 
-    const playlist = await this.request(`/playlists/${parsed.id}?fields=name,external_urls,tracks.items(track(name,duration_ms,artists(name),external_urls,album(images),is_local)),tracks.next`);
+    let playlist;
+    try {
+      playlist = await this.request(`/playlists/${parsed.id}?fields=name,external_urls,tracks.items(track(name,duration_ms,artists(name),external_urls,album(images),is_local)),tracks.next`);
+    } catch (error) {
+      if (error.status === 404) {
+        // Spotify's Web API returns 404 for all Spotify-generated playlists
+        // (Liked Songs, Daily Mix, Discover Weekly, editorial lists) since the
+        // November 2024 API restrictions. Their IDs start with "37i9dQZF".
+        if (parsed.id.startsWith("37i9dQZF")) {
+          throw new Error(
+            "Spotify blocks bots from reading its auto-generated playlists (Liked Songs, Daily Mix, Discover Weekly, etc.). " +
+              "Copy the songs into a regular playlist (select all → Add to playlist), make it public, and share that link instead."
+          );
+        }
+
+        throw new Error("I couldn't find that Spotify playlist. It may be private or deleted — make it public and try again.");
+      }
+
+      throw error;
+    }
     const tracks = [];
 
     let currentPage = playlist.tracks;

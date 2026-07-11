@@ -276,6 +276,16 @@ class MusicService {
     const onTracks = typeof options.onTracks === "function" ? options.onTracks : null;
     const tracks = [];
 
+    if (playlist.tracks.length === 0) {
+      throw new Error(
+        `Spotify returned "${playlist.name}" with zero tracks. If you just created it, wait a minute for Spotify to sync and try again.`
+      );
+    }
+
+    // When nothing resolves, the per-track errors are the only clue to the real
+    // cause (e.g. YouTube blocking the Lavalink host), so keep a tally of them.
+    const failureCounts = new Map();
+
     for (let start = 0; start < playlist.tracks.length; start += SPOTIFY_RESOLVE_BATCH_SIZE) {
       const batch = playlist.tracks.slice(start, start + SPOTIFY_RESOLVE_BATCH_SIZE);
       const resolvedBatch = await mapWithConcurrency(
@@ -289,19 +299,25 @@ class MusicService {
             });
 
             const firstTrack = result.tracks[0];
-            if (firstTrack && track.artworkUrl && !firstTrack.info.artworkUrl) {
+
+            if (!firstTrack) {
+              failureCounts.set("no playable result", (failureCounts.get("no playable result") || 0) + 1);
+              return null;
+            }
+
+            if (track.artworkUrl && !firstTrack.info.artworkUrl) {
               firstTrack.info.artworkUrl = track.artworkUrl;
             }
 
-            if (firstTrack) {
-              firstTrack.canonical = {
-                title: track.name,
-                artists: track.artists.map((artist) => artist.name)
-              };
-            }
+            firstTrack.canonical = {
+              title: track.name,
+              artists: track.artists.map((artist) => artist.name)
+            };
 
-            return firstTrack || null;
-          } catch {
+            return firstTrack;
+          } catch (error) {
+            const reason = error.message || "unknown error";
+            failureCounts.set(reason, (failureCounts.get(reason) || 0) + 1);
             return null;
           }
         }
@@ -321,7 +337,22 @@ class MusicService {
     }
 
     if (tracks.length === 0) {
-      throw new Error("I could not resolve any playable tracks from that Spotify playlist.");
+      // Report the most common underlying error so an infrastructure problem
+      // (like YouTube bot-blocking the Lavalink host) is visible to the user
+      // instead of hiding behind a generic "nothing resolved" message.
+      const topFailures = [...failureCounts.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 2)
+        .map(([reason, count]) => `"${reason}" (${count} track${count === 1 ? "" : "s"})`);
+
+      console.warn(`Spotify playlist "${playlist.name}": 0 of ${playlist.tracks.length} tracks resolved. Failures: ${topFailures.join("; ") || "none recorded"}`);
+
+      throw new Error(
+        `I fetched **${playlist.name}** (${playlist.tracks.length} tracks) from Spotify, but could not load audio for any of them. ` +
+          (topFailures.length > 0
+            ? `The YouTube lookups failed with: ${topFailures.join("; ")}.`
+            : "The YouTube lookups returned no results.")
+      );
     }
 
     return {
