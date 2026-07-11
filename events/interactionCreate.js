@@ -155,6 +155,22 @@ async function handleMusicControls(client, interaction) {
       return;
     }
 
+    if (action === "shuffle") {
+      if (state.queue.length < 2) {
+        await interaction.followUp({
+          embeds: [createErrorEmbed("You need at least two queued tracks to shuffle.")],
+          flags: MessageFlags.Ephemeral
+        }).catch(() => null);
+        return;
+      }
+
+      client.playerManager.shuffleQueue(interaction.guildId);
+      await interaction.followUp({
+        embeds: [createSuccessEmbed(`Shuffled **${state.queue.length}** upcoming tracks.`, "Queue shuffled")]
+      }).catch(() => null);
+      return;
+    }
+
     if (action === "skip") {
       await client.playerManager.skip(interaction.guildId);
       return;

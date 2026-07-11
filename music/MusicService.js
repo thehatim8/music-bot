@@ -1,6 +1,6 @@
 const SpotifyService = require("./SpotifyService");
 const AutoplayService = require("./AutoplayService");
-const { SPOTIFY_RESOLVE_CONCURRENCY } = require("../utils/constants");
+const { SPOTIFY_RESOLVE_BATCH_SIZE, SPOTIFY_RESOLVE_CONCURRENCY } = require("../utils/constants");
 const { mapWithConcurrency } = require("../utils/async");
 
 class MusicService {
@@ -74,7 +74,7 @@ class MusicService {
         throw new Error("Only single tracks can be added here. Use a specific song instead of a playlist.");
       }
 
-      return this.resolveSpotifyPlaylist(query, requester);
+      return this.resolveSpotifyPlaylist(query, requester, options);
     }
 
     if (!this.isUrl(query)) {
@@ -266,38 +266,59 @@ class MusicService {
     };
   }
 
-  async resolveSpotifyPlaylist(url, requester) {
+  // Playlists can be arbitrarily long, so tracks are resolved in ordered batches.
+  // When the caller provides options.onTracks, each batch is handed over as soon as
+  // it is playable (still in playlist order), letting playback start after the first
+  // batch instead of after the whole playlist. An onTracks callback that throws
+  // aborts the remaining resolution (e.g. the player was stopped mid-load).
+  async resolveSpotifyPlaylist(url, requester, options = {}) {
     const playlist = await this.spotify.getPlaylist(url);
-    const resolvedTracks = await mapWithConcurrency(
-      playlist.tracks,
-      SPOTIFY_RESOLVE_CONCURRENCY,
-      async (track) => {
-        try {
-          const result = await this.resolveLavalink(track.searchQuery, requester, {
-            allowPlaylists: false,
-            sourceLabel: "Spotify"
-          });
+    const onTracks = typeof options.onTracks === "function" ? options.onTracks : null;
+    const tracks = [];
 
-          const firstTrack = result.tracks[0];
-          if (firstTrack && track.artworkUrl && !firstTrack.info.artworkUrl) {
-            firstTrack.info.artworkUrl = track.artworkUrl;
+    for (let start = 0; start < playlist.tracks.length; start += SPOTIFY_RESOLVE_BATCH_SIZE) {
+      const batch = playlist.tracks.slice(start, start + SPOTIFY_RESOLVE_BATCH_SIZE);
+      const resolvedBatch = await mapWithConcurrency(
+        batch,
+        SPOTIFY_RESOLVE_CONCURRENCY,
+        async (track) => {
+          try {
+            const result = await this.resolveLavalink(track.searchQuery, requester, {
+              allowPlaylists: false,
+              sourceLabel: "Spotify"
+            });
+
+            const firstTrack = result.tracks[0];
+            if (firstTrack && track.artworkUrl && !firstTrack.info.artworkUrl) {
+              firstTrack.info.artworkUrl = track.artworkUrl;
+            }
+
+            if (firstTrack) {
+              firstTrack.canonical = {
+                title: track.name,
+                artists: track.artists.map((artist) => artist.name)
+              };
+            }
+
+            return firstTrack || null;
+          } catch {
+            return null;
           }
-
-          if (firstTrack) {
-            firstTrack.canonical = {
-              title: track.name,
-              artists: track.artists.map((artist) => artist.name)
-            };
-          }
-
-          return firstTrack || null;
-        } catch {
-          return null;
         }
-      }
-    );
+      );
 
-    const tracks = resolvedTracks.filter(Boolean);
+      const playable = resolvedBatch.filter(Boolean);
+      tracks.push(...playable);
+
+      if (onTracks && playable.length > 0) {
+        await onTracks(playable, {
+          title: playlist.name,
+          totalTracks: playlist.tracks.length,
+          resolvedSoFar: tracks.length,
+          remaining: Math.max(0, playlist.tracks.length - (start + batch.length))
+        });
+      }
+    }
 
     if (tracks.length === 0) {
       throw new Error("I could not resolve any playable tracks from that Spotify playlist.");

@@ -81,6 +81,16 @@ function createPlayerControlsRow(state) {
   );
 }
 
+function createShuffleButtonRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("music:shuffle")
+      .setLabel("Shuffle")
+      .setEmoji("🔀")
+      .setStyle(ButtonStyle.Primary)
+  );
+}
+
 function createNowPlayingPayload(track, state) {
   const footer = `Loop: ${state.loopMode} | Autoplay: ${state.autoplayEnabled ? "On" : "Off"}`;
 
@@ -96,6 +106,7 @@ module.exports = {
   createInfoEmbed,
   createNowPlayingPayload,
   createPlayerControlsRow,
+  createShuffleButtonRow,
   createSuccessEmbed,
   createTrackEmbed
 };
