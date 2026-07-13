@@ -84,15 +84,15 @@ class SpotifyService {
   }
 
   buildSearchQuery(track) {
-    const artists = track.artists.map((artist) => artist.name).join(", ");
-    return `${artists} - ${track.name} official audio`;
+    const artists = (track.artists || []).map((artist) => artist.name).filter(Boolean).join(", ");
+    return artists ? `${artists} - ${track.name} official audio` : `${track.name} official audio`;
   }
 
   normalizeTrack(track) {
     return {
       id: track.id,
       name: track.name,
-      artists: track.artists.map((artist) => ({ name: artist.name })),
+      artists: (track.artists || []).map((artist) => ({ name: artist.name })),
       duration: track.duration_ms,
       url: track.external_urls?.spotify || null,
       artworkUrl: track.album?.images?.[0]?.url || null,
@@ -133,6 +133,81 @@ class SpotifyService {
     return track ? this.normalizeTrack(track) : null;
   }
 
+  translatePlaylistError(error, playlistId) {
+    if (error.status !== 404) {
+      return error;
+    }
+
+    // Spotify's Web API returns 404 for all Spotify-generated playlists
+    // (Liked Songs, Daily Mix, Discover Weekly, editorial lists) since the
+    // November 2024 API restrictions. Their IDs start with "37i9dQZF".
+    if (playlistId.startsWith("37i9dQZF")) {
+      return new Error(
+        "Spotify blocks bots from reading its auto-generated playlists (Liked Songs, Daily Mix, Discover Weekly, etc.). " +
+          "Copy the songs into a regular playlist (select all → Add to playlist), make it public, and share that link instead."
+      );
+    }
+
+    return new Error("I couldn't find that Spotify playlist. It may be private or deleted — make it public and try again.");
+  }
+
+  // Reads every page of a playlist's tracks. Deliberately does NOT use the `fields`
+  // filter: the filtered form of the playlist endpoint has been observed to return an
+  // empty `items` array for playlists the API otherwise serves fine. The unfiltered
+  // payload is larger but is the documented, reliable shape. `market` is also left off
+  // on purpose — with a market set, Spotify nulls out items unavailable there, which
+  // would silently drop tracks.
+  async getPlaylistTracks(playlistId) {
+    const tracks = [];
+    const dropped = { nullTrack: 0, local: 0, notASong: 0, unusable: 0 };
+    let itemsSeen = 0;
+    let total = null;
+    let next = `/playlists/${playlistId}/tracks?limit=100&offset=0&additional_types=track`;
+
+    while (next) {
+      const page = await this.request(next);
+      const items = Array.isArray(page.items) ? page.items : [];
+
+      if (typeof page.total === "number") {
+        total = page.total;
+      }
+
+      itemsSeen += items.length;
+
+      for (const item of items) {
+        const track = item?.track;
+
+        if (!track) {
+          // Spotify sends `null` for tracks it can't serve to this request
+          // (region-locked or removed from the catalogue).
+          dropped.nullTrack += 1;
+          continue;
+        }
+
+        if (track.is_local) {
+          dropped.local += 1;
+          continue;
+        }
+
+        if (track.type && track.type !== "track") {
+          dropped.notASong += 1;
+          continue;
+        }
+
+        if (!track.name) {
+          dropped.unusable += 1;
+          continue;
+        }
+
+        tracks.push(this.normalizeTrack(track));
+      }
+
+      next = page.next || null;
+    }
+
+    return { tracks, stats: { total, itemsSeen, dropped } };
+  }
+
   async getPlaylist(url) {
     const parsed = this.parseSpotifyUrl(url);
 
@@ -142,57 +217,26 @@ class SpotifyService {
 
     let playlist;
     try {
-      playlist = await this.request(`/playlists/${parsed.id}?fields=name,external_urls,tracks.items(track(name,duration_ms,artists(name),external_urls,album(images),is_local)),tracks.next`);
+      playlist = await this.request(`/playlists/${parsed.id}?fields=name,external_urls,tracks.total`);
     } catch (error) {
-      if (error.status === 404) {
-        // Spotify's Web API returns 404 for all Spotify-generated playlists
-        // (Liked Songs, Daily Mix, Discover Weekly, editorial lists) since the
-        // November 2024 API restrictions. Their IDs start with "37i9dQZF".
-        if (parsed.id.startsWith("37i9dQZF")) {
-          throw new Error(
-            "Spotify blocks bots from reading its auto-generated playlists (Liked Songs, Daily Mix, Discover Weekly, etc.). " +
-              "Copy the songs into a regular playlist (select all → Add to playlist), make it public, and share that link instead."
-          );
-        }
-
-        throw new Error("I couldn't find that Spotify playlist. It may be private or deleted — make it public and try again.");
-      }
-
-      throw error;
+      throw this.translatePlaylistError(error, parsed.id);
     }
-    const tracks = [];
 
-    let currentPage = playlist.tracks;
-    while (currentPage) {
-      for (const item of currentPage.items) {
-        const track = item.track;
-
-        if (!track || track.is_local) {
-          continue;
-        }
-
-        tracks.push({
-          id: track.id,
-          name: track.name,
-          artists: track.artists.map((artist) => ({ name: artist.name })),
-          duration: track.duration_ms,
-          url: track.external_urls.spotify,
-          artworkUrl: track.album?.images?.[0]?.url || null,
-          searchQuery: this.buildSearchQuery(track)
-        });
-      }
-
-      if (!currentPage.next) {
-        break;
-      }
-
-      currentPage = await this.request(currentPage.next);
+    let result;
+    try {
+      result = await this.getPlaylistTracks(parsed.id);
+    } catch (error) {
+      throw this.translatePlaylistError(error, parsed.id);
     }
 
     return {
       name: playlist.name,
       url: playlist.external_urls?.spotify || url,
-      tracks
+      tracks: result.tracks,
+      stats: {
+        ...result.stats,
+        total: result.stats.total ?? playlist.tracks?.total ?? null
+      }
     };
   }
 }

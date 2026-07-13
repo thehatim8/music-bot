@@ -266,6 +266,43 @@ class MusicService {
     };
   }
 
+  // A playlist that Spotify serves but from which no track survives is almost always
+  // a permissions/region problem, not an empty playlist. Distinguish the cases so the
+  // user is told what to actually fix rather than to "wait and try again".
+  describeEmptyPlaylist(playlist) {
+    const stats = playlist.stats || {};
+    const dropped = stats.dropped || {};
+    const total = stats.total;
+
+    console.warn(
+      `Spotify playlist "${playlist.name}": 0 usable tracks. total=${total ?? "?"} itemsReturned=${stats.itemsSeen ?? "?"} ` +
+        `dropped=${JSON.stringify(dropped)}`
+    );
+
+    if (dropped.nullTrack > 0) {
+      return (
+        `Spotify listed **${dropped.nullTrack}** track(s) in **${playlist.name}** but refused to send their details, ` +
+        "which usually means the playlist is region-locked or the tracks are unavailable to the bot's Spotify app."
+      );
+    }
+
+    if (dropped.local > 0 && dropped.local === stats.itemsSeen) {
+      return `Every track in **${playlist.name}** is a local file, which Spotify does not stream to apps. Add songs from Spotify's catalogue instead.`;
+    }
+
+    if (total > 0 && stats.itemsSeen === 0) {
+      return (
+        `Spotify says **${playlist.name}** has ${total} track(s), but returned none of them to the bot. ` +
+        "This normally means the playlist is set to private — open it in Spotify, choose \"Make public\", and try again."
+      );
+    }
+
+    return (
+      `Spotify returned **${playlist.name}** with no playable tracks. ` +
+      "If the playlist is private, make it public; if the songs are local files, they cannot be streamed."
+    );
+  }
+
   // Playlists can be arbitrarily long, so tracks are resolved in ordered batches.
   // When the caller provides options.onTracks, each batch is handed over as soon as
   // it is playable (still in playlist order), letting playback start after the first
@@ -277,9 +314,7 @@ class MusicService {
     const tracks = [];
 
     if (playlist.tracks.length === 0) {
-      throw new Error(
-        `Spotify returned "${playlist.name}" with zero tracks. If you just created it, wait a minute for Spotify to sync and try again.`
-      );
+      throw new Error(this.describeEmptyPlaylist(playlist));
     }
 
     // When nothing resolves, the per-track errors are the only clue to the real
