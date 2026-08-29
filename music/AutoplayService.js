@@ -57,24 +57,6 @@ class AutoplayService {
 
   async resolve(referenceTrack, requester, excludedTracks = []) {
     const context = this.buildContext(referenceTrack, excludedTracks);
-    const videoId = this.getVideoId(referenceTrack);
-
-    if (videoId) {
-      try {
-        const track = await this.resolveCandidateList(await this.fetchRelated(videoId), requester, context, {
-          sourceLabel: "Autoplay",
-          decorateAutoplay: true,
-          autoplaySource: "ytmusic"
-        });
-
-        if (track) {
-          return track;
-        }
-      } catch (error) {
-        console.warn(`YTMusic related resolver failed: ${error.message}`);
-      }
-    }
-
     return this.resolveFallback(requester, context);
   }
 
@@ -392,24 +374,17 @@ class AutoplayService {
 
   async resolveFallback(requester, context) {
     const strictQueries = this.buildFallbackQueries(context, { broaden: false });
-    const strictTrack =
-      (await this.resolveFallbackQueries(strictQueries, requester, context, { allowLowConfidence: false })) ||
-      (await this.resolveLavalinkFallback(strictQueries, requester, context, { allowLowConfidence: false }));
+    const strictTrack = await this.resolveLavalinkFallback(strictQueries, requester, context, { allowLowConfidence: false });
 
     if (strictTrack) {
       return strictTrack;
     }
 
     const relaxedQueries = this.buildFallbackQueries(context, { broaden: true });
-    const relaxedTrack =
-      (await this.resolveFallbackQueries(relaxedQueries, requester, context, {
-        allowLowConfidence: false,
-        ignoreSeedArtistLock: true
-      })) ||
-      (await this.resolveLavalinkFallback(relaxedQueries, requester, context, {
-        allowLowConfidence: true,
-        ignoreSeedArtistLock: true
-      }));
+    const relaxedTrack = await this.resolveLavalinkFallback(relaxedQueries, requester, context, {
+      allowLowConfidence: true,
+      ignoreSeedArtistLock: true
+    });
 
     if (relaxedTrack) {
       return relaxedTrack;
@@ -463,21 +438,15 @@ class AutoplayService {
     const currentTitle = context.currentProfile.cleanedTitle;
 
     if (seedArtist) {
+      addQuery(seedArtist);
       addQuery([seedArtist, currentTitle].filter(Boolean).join(" "));
       addQuery([seedArtist, seedTitle].filter(Boolean).join(" "));
-      addQuery(`${seedArtist} songs`);
-      addQuery(`${seedArtist} popular songs`);
-      addQuery(`${seedArtist} official audio`);
     }
 
     if (broaden) {
+      addQuery(currentArtist);
       addQuery([currentArtist, currentTitle].filter(Boolean).join(" "));
       addQuery([currentArtist, seedTitle].filter(Boolean).join(" "));
-
-      if (currentArtist && this.normalizeText(currentArtist) !== this.normalizeText(seedArtist)) {
-        addQuery(`${currentArtist} songs`);
-        addQuery(`${currentArtist} popular songs`);
-      }
     }
 
     return queries.slice(0, broaden ? 10 : 6);
@@ -487,7 +456,7 @@ class AutoplayService {
     const node = this.client.playerManager.getSearchNode();
 
     for (const query of queries) {
-      const result = await node.rest.resolve(`ytsearch:${query}`).catch(() => null);
+      const result = await node.rest.resolve(`scsearch:${query}`).catch(() => null);
       if (!result) {
         continue;
       }
@@ -522,7 +491,7 @@ class AutoplayService {
           continue;
         }
 
-        this.decorateTrackForAutoplay(queueTrack, candidate, context, "ytsearch");
+        this.decorateTrackForAutoplay(queueTrack, candidate, context, "soundcloud");
         return queueTrack;
       }
     }
