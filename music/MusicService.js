@@ -27,7 +27,11 @@ class MusicService {
       info: {
         ...rawTrack.info,
         artworkUrl,
-        uri: rawTrack.info.uri || (rawTrack.info.identifier ? `https://www.youtube.com/watch?v=${rawTrack.info.identifier}` : null)
+        uri:
+          rawTrack.info.uri ||
+          (rawTrack.info.sourceName === "youtube" && rawTrack.info.identifier
+            ? `https://www.youtube.com/watch?v=${rawTrack.info.identifier}`
+            : null)
       },
       requester: {
         id: requester.id,
@@ -112,35 +116,20 @@ class MusicService {
       }
     }
 
-    const ytmusicTrack = await this.autoplay.resolveYouTubeMusicSearch(query, requester).catch((error) => {
-      console.warn(`YouTube Music search resolver failed: ${error.message}`);
-      failures.push(`YouTube Music search failed (${error.message})`);
+    const soundcloudTrack = await this.resolveDirectSearch(query, requester).catch((error) => {
+      console.warn(`Direct SoundCloud search failed: ${error.message}`);
+      failures.push(`Direct SoundCloud search failed (${error.message})`);
       return null;
     });
 
-    if (ytmusicTrack) {
-      return {
-        type: "track",
-        source: "ytmusic",
-        title: ytmusicTrack.info.title,
-        tracks: [ytmusicTrack]
-      };
+    if (soundcloudTrack) {
+      return soundcloudTrack;
     }
 
     // Last resort: search Lavalink directly. We still keep this honest by picking
     // the first result that passes the song sanity checks (real song length, not a
     // live/lyric/mix upload) so we never queue a random hour-long video, but unlike
     // the autoplay path we don't require a seed artist — this is a direct search.
-    const lavalinkTrack = await this.resolveDirectSearch(query, requester).catch((error) => {
-      console.warn(`Direct Lavalink search failed: ${error.message}`);
-      failures.push(`Direct YouTube search failed (${error.message})`);
-      return null;
-    });
-
-    if (lavalinkTrack) {
-      return lavalinkTrack;
-    }
-
     // Distinguish "every source errored out" (a credential/host/network problem) from a
     // genuine "no match", so the user gets an actionable message instead of being told to
     // pick a more specific song when the real issue is infrastructure.
@@ -159,10 +148,10 @@ class MusicService {
     // Don't swallow load failures: a YouTube error (e.g. a "confirm you're not a bot"
     // block on the host) must surface to the caller rather than silently looking like
     // "no results". Lavalink reports these as loadType "error" in the response body.
-    const result = await node.rest.resolve(`ytsearch:${query}`);
+    const result = await node.rest.resolve(`scsearch:${query}`);
 
     if (result?.loadType === "error") {
-      throw new Error(result.data?.message || "YouTube search returned an error.");
+      throw new Error(result.data?.message || "SoundCloud search returned an error.");
     }
 
     const tracks = this.getLavalinkTracks(result).filter((track) => track?.encoded);
@@ -190,15 +179,18 @@ class MusicService {
 
     return {
       type: "track",
-      source: "youtube",
+      source: "soundcloud",
       title: chosen.info.title,
-      tracks: [this.createQueueTrack(chosen, requester, "YouTube")]
+      tracks: [this.createQueueTrack(chosen, requester, "SoundCloud")]
     };
   }
 
   async resolveStoredTrack(song, requester) {
+    const url = String(song.url || "");
+    const isYouTubeUrl = /^(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\//i.test(url);
+
     try {
-      const result = await this.resolveLavalink(song.url, requester, { allowPlaylists: false });
+      const result = await this.resolveLavalink(isYouTubeUrl ? song.title : url, requester, { allowPlaylists: false });
       return result.tracks[0];
     } catch {
       const result = await this.resolveLavalink(song.title, requester, { allowPlaylists: false });
@@ -246,7 +238,7 @@ class MusicService {
     const firstTrack = resolved.tracks[0];
 
     if (!firstTrack) {
-      throw new Error(`No playable YouTube result was found for "${track.name}".`);
+      throw new Error(`No playable SoundCloud result was found for "${track.name}".`);
     }
 
     if (track.artworkUrl && !firstTrack.info.artworkUrl) {
@@ -401,7 +393,7 @@ class MusicService {
 
   async resolveLavalink(query, requester, options = {}) {
     const node = this.client.playerManager.getSearchNode();
-    const identifier = this.isUrl(query) ? query : `ytsearch:${query}`;
+    const identifier = this.isUrl(query) ? query : `scsearch:${query}`;
     const result = await node.rest.resolve(identifier);
 
     if (!result) {
@@ -423,10 +415,10 @@ class MusicService {
 
       return {
         type: "playlist",
-        source: "youtube",
+        source: "soundcloud",
         title: result.data.info.name,
         tracks: result.data.tracks.map((track) =>
-          this.createQueueTrack(track, requester, options.sourceLabel || "YouTube")
+          this.createQueueTrack(track, requester, options.sourceLabel || "SoundCloud")
         )
       };
     }
@@ -439,9 +431,9 @@ class MusicService {
 
     return {
       type: "track",
-      source: options.sourceLabel?.toLowerCase() || "youtube",
+      source: options.sourceLabel?.toLowerCase() || "soundcloud",
       title: rawTrack.info.title,
-      tracks: [this.createQueueTrack(rawTrack, requester, options.sourceLabel || "YouTube")]
+      tracks: [this.createQueueTrack(rawTrack, requester, options.sourceLabel || "SoundCloud")]
     };
   }
 }
