@@ -104,7 +104,17 @@ class MusicService {
       return null;
     });
 
-    if (spotifyMatch) {
+    // Spotify's top hit for an obscure song can be an unrelated popular track. Only
+    // trust it when it actually shares the searched words.
+    const spotifyMatchRelevant =
+      spotifyMatch &&
+      this.autoplay.isQueryRelevant(query, spotifyMatch.name, spotifyMatch.artists.map((artist) => artist.name).join(" "));
+
+    if (spotifyMatch && !spotifyMatchRelevant) {
+      console.warn(`Ignoring Spotify match "${spotifyMatch.name}" for "${query}": not relevant to the query.`);
+    }
+
+    if (spotifyMatchRelevant) {
       const resolved = await this.resolveCanonicalSpotifyTrack(spotifyMatch, requester).catch((error) => {
         console.warn(`Failed to resolve audio for Spotify match "${spotifyMatch.name}": ${error.message}`);
         failures.push(`Matched "${spotifyMatch.name}" on Spotify but could not load its audio (${error.message})`);
@@ -234,12 +244,7 @@ class MusicService {
   // tag it with the canonical Spotify title/artists. Shared by direct Spotify
   // URLs and by text searches resolved through Spotify.
   async resolveCanonicalSpotifyTrack(track, requester) {
-    const resolved = await this.resolveLavalink(track.searchQuery, requester, { allowPlaylists: false, sourceLabel: "Spotify" });
-    const firstTrack = resolved.tracks[0];
-
-    if (!firstTrack) {
-      throw new Error(`No playable SoundCloud result was found for "${track.name}".`);
-    }
+    const firstTrack = await this.resolveSpotifyAudio(track, requester);
 
     if (track.artworkUrl && !firstTrack.info.artworkUrl) {
       firstTrack.info.artworkUrl = track.artworkUrl;
@@ -256,6 +261,121 @@ class MusicService {
       tracks: [firstTrack],
       title: track.name
     };
+  }
+
+  // SoundCloud search always returns *something*, and its top hit is frequently an
+  // unrelated upload. Never trust result #1: search artist + title (then title alone)
+  // and only accept a result whose title really is this song, by this artist or with
+  // the same length. If nothing matches, fail rather than play the wrong song.
+  async resolveSpotifyAudio(spotifyTrack, requester) {
+    const node = this.client.playerManager.getSearchNode();
+    const searchTitle = this.stripTitleExtras(spotifyTrack.name) || spotifyTrack.name;
+    const artistNames = spotifyTrack.artists.map((artist) => artist.name).filter(Boolean);
+    const queries = [...new Set([`${artistNames.join(" ")} ${searchTitle}`.trim(), searchTitle])];
+    let lastError = null;
+
+    for (const query of queries) {
+      const result = await node.rest.resolve(`scsearch:${query}`).catch((error) => {
+        lastError = error;
+        return null;
+      });
+
+      if (result?.loadType === "error") {
+        lastError = new Error(result.data?.message || "SoundCloud search returned an error.");
+        continue;
+      }
+
+      const best = this.getLavalinkTracks(result)
+        .filter((candidate) => candidate?.encoded)
+        .map((candidate) => ({ candidate, score: this.scoreSpotifyCandidate(candidate, spotifyTrack, searchTitle, artistNames) }))
+        .filter((entry) => entry.score > 0)
+        .sort((a, b) => b.score - a.score)[0];
+
+      if (best) {
+        return this.createQueueTrack(best.candidate, requester, "Spotify");
+      }
+    }
+
+    if (lastError) {
+      throw lastError;
+    }
+
+    const byLine = artistNames.length > 0 ? ` by ${artistNames.join(", ")}` : "";
+    throw new Error(`Couldn't find "${spotifyTrack.name}"${byLine} on SoundCloud.`);
+  }
+
+  // Returns 0 when the candidate is not this song, otherwise a positive score.
+  scoreSpotifyCandidate(candidate, spotifyTrack, searchTitle, artistNames) {
+    const autoplay = this.autoplay;
+    const info = candidate.info || {};
+
+    if (info.isStream) {
+      return 0;
+    }
+
+    const haystack = autoplay.normalizeText(`${info.title || ""} ${info.author || ""}`);
+    const compactHaystack = haystack.replace(/\s+/g, "");
+
+    // Title: every meaningful word of the song title must appear.
+    const titleTokens = [...autoplay.tokenizeTitle(searchTitle)];
+    const normalizedTitle = autoplay.normalizeText(searchTitle);
+    const titleMatches =
+      titleTokens.length > 0
+        ? titleTokens.every((token) => haystack.includes(token))
+        : normalizedTitle.length > 0 && haystack.includes(normalizedTitle);
+
+    if (!titleMatches) {
+      return 0;
+    }
+
+    // Don't swap a studio song for a remix/cover/live take unless that is what Spotify has.
+    const spotifyTitle = String(spotifyTrack.name || "").toLowerCase();
+    const extraVariant = ["remix", "cover", "live", "slowed", "reverb", "sped up", "nightcore", "8d", "instrumental", "karaoke"].find(
+      (word) => new RegExp(`\\b${word}\\b`, "i").test(info.title || "") && !spotifyTitle.includes(word)
+    );
+
+    if (extraVariant) {
+      return 0;
+    }
+
+    // Duration: SoundCloud serves 30s previews for Go+ tracks and many re-uploads differ in
+    // length. Reject anything clearly not the same recording.
+    const expected = Number(spotifyTrack.duration);
+    const actual = Number(info.length);
+    let durationDiff = null;
+
+    if (Number.isFinite(expected) && expected > 0 && Number.isFinite(actual) && actual > 0) {
+      durationDiff = Math.abs(expected - actual);
+
+      if (durationDiff > Math.max(15000, expected * 0.15)) {
+        return 0;
+      }
+    }
+
+    // Artist: uploader names are often mangled ("jj47official"), so compare without spaces.
+    const artistMatches = artistNames.some((name) => {
+      const compactArtist = autoplay.normalizeText(autoplay.cleanArtist(name)).replace(/\s+/g, "");
+      return compactArtist.length > 0 && compactHaystack.includes(compactArtist);
+    });
+
+    // A same-titled song by someone else is only trusted if its length matches closely.
+    if (!artistMatches && (durationDiff === null || durationDiff > 5000)) {
+      return 0;
+    }
+
+    let score = 10;
+    if (artistMatches) score += 10;
+    if (durationDiff !== null) score += Math.max(0, 10 - durationDiff / 1000);
+    return score;
+  }
+
+  // "Song (feat. X) - 2011 Remaster" -> "Song"
+  stripTitleExtras(title) {
+    return String(title || "")
+      .replace(/\s*[([][^)\]]*\b(feat|ft|with|remaster(ed)?|version|edit|from)\b[^)\]]*[)\]]/gi, "")
+      .replace(/\s+-\s+.*\b(remaster(ed)?|version|edit|mono|stereo|from)\b.*$/i, "")
+      .replace(/\s+/g, " ")
+      .trim();
   }
 
   // A playlist that Spotify serves but from which no track survives is almost always
@@ -320,17 +440,7 @@ class MusicService {
         SPOTIFY_RESOLVE_CONCURRENCY,
         async (track) => {
           try {
-            const result = await this.resolveLavalink(track.searchQuery, requester, {
-              allowPlaylists: false,
-              sourceLabel: "Spotify"
-            });
-
-            const firstTrack = result.tracks[0];
-
-            if (!firstTrack) {
-              failureCounts.set("no playable result", (failureCounts.get("no playable result") || 0) + 1);
-              return null;
-            }
+            const firstTrack = await this.resolveSpotifyAudio(track, requester);
 
             if (track.artworkUrl && !firstTrack.info.artworkUrl) {
               firstTrack.info.artworkUrl = track.artworkUrl;

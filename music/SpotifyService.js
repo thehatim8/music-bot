@@ -83,9 +83,12 @@ class SpotifyService {
     return response.json();
   }
 
+  // Audio is searched on SoundCloud, whose fuzzy search matches on any word. A
+  // YouTube-style "official audio" suffix made it return unrelated uploads that
+  // happen to have "(Official Audio)" in their title, so search on artist + title only.
   buildSearchQuery(track) {
-    const artists = (track.artists || []).map((artist) => artist.name).filter(Boolean).join(", ");
-    return artists ? `${artists} - ${track.name} official audio` : `${track.name} official audio`;
+    const artists = (track.artists || []).map((artist) => artist.name).filter(Boolean).join(" ");
+    return artists ? `${artists} ${track.name}` : track.name;
   }
 
   normalizeTrack(track) {
