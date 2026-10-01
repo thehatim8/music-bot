@@ -42,6 +42,14 @@ module.exports = {
     clientSecret: requireEnv("SPOTIFY_CLIENT_SECRET"),
     market: process.env.SPOTIFY_MARKET?.trim() || "PK"
   },
+  search: {
+    // Lavalink search prefixes, tried in order. A song that fails to resolve or to
+    // play on one provider is retried on the next.
+    providers: (process.env.SEARCH_PROVIDERS || "ytmsearch,ytsearch,scsearch")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean)
+  },
   ytmusicAutoplay: {
     url: process.env.YTMUSIC_AUTOPLAY_URL?.trim() || "http://127.0.0.1:3001"
   },

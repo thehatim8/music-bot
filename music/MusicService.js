@@ -3,11 +3,92 @@ const AutoplayService = require("./AutoplayService");
 const { SPOTIFY_RESOLVE_BATCH_SIZE, SPOTIFY_RESOLVE_CONCURRENCY } = require("../utils/constants");
 const { mapWithConcurrency } = require("../utils/async");
 
+const PROVIDER_LABELS = Object.freeze({
+  ytmsearch: "YouTube Music",
+  ytsearch: "YouTube",
+  scsearch: "SoundCloud",
+  bcsearch: "Bandcamp",
+  dzsearch: "Deezer",
+  amsearch: "Apple Music",
+  jssearch: "JioSaavn"
+});
+
 class MusicService {
   constructor(client) {
     this.client = client;
     this.spotify = new SpotifyService(client.config);
     this.autoplay = new AutoplayService(this);
+    this.providers = (client.config.search?.providers?.length ? client.config.search.providers : ["scsearch"]).map((prefix) => ({
+      prefix,
+      label: PROVIDER_LABELS[prefix] || prefix
+    }));
+  }
+
+  getProviders(skip = []) {
+    return this.providers.filter((provider) => !skip.includes(provider.prefix));
+  }
+
+  getProviderLabel(prefix) {
+    return this.providers.find((provider) => provider.prefix === prefix)?.label || PROVIDER_LABELS[prefix] || prefix;
+  }
+
+  // Runs one search on one provider. Load errors are thrown so callers can record
+  // them and move on to the next provider.
+  async searchProvider(provider, query) {
+    const node = this.client.playerManager.getSearchNode();
+    const result = await node.rest.resolve(`${provider.prefix}:${query}`);
+
+    if (result?.loadType === "error") {
+      throw new Error(result.data?.message || `${provider.label} search returned an error.`);
+    }
+
+    return this.getLavalinkTracks(result).filter((track) => track?.encoded);
+  }
+
+  // Information needed to find the same song again on another provider if this
+  // one fails to stream it.
+  attachFallback(queueTrack, descriptor, provider, previouslyTried = []) {
+    queueTrack.fallback = {
+      ...descriptor,
+      artists: [...(descriptor.artists || [])],
+      tried: [...new Set([...previouslyTried, provider.prefix])]
+    };
+    queueTrack.provider = provider.prefix;
+    return queueTrack;
+  }
+
+  // Called by the player when a track fails to load or play. Finds the same song on
+  // a provider that hasn't been tried yet, or returns null.
+  async resolveAlternative(failedTrack) {
+    const fallback = failedTrack?.fallback;
+
+    if (!fallback) {
+      return null;
+    }
+
+    const requester = { id: failedTrack.requester.id, tag: failedTrack.requester.tag };
+    const options = { skip: fallback.tried, sourceLabel: failedTrack.sourceLabel };
+    const replacement = fallback.title
+      ? await this.resolveMatchedAudio(fallback, requester, options).catch(() => null)
+      : (await this.resolveDirectSearch(fallback.query, requester, options).catch(() => null))?.tracks[0];
+
+    if (!replacement) {
+      return null;
+    }
+
+    if (failedTrack.canonical && !replacement.canonical) {
+      replacement.canonical = { title: failedTrack.canonical.title, artists: [...failedTrack.canonical.artists] };
+    }
+
+    if (failedTrack.info.artworkUrl && !replacement.info.artworkUrl) {
+      replacement.info.artworkUrl = failedTrack.info.artworkUrl;
+    }
+
+    if (failedTrack.autoplay) {
+      replacement.autoplay = failedTrack.autoplay;
+    }
+
+    return replacement;
   }
 
   isUrl(input) {
@@ -126,14 +207,14 @@ class MusicService {
       }
     }
 
-    const soundcloudTrack = await this.resolveDirectSearch(query, requester).catch((error) => {
-      console.warn(`Direct SoundCloud search failed: ${error.message}`);
-      failures.push(`Direct SoundCloud search failed (${error.message})`);
+    const directTrack = await this.resolveDirectSearch(query, requester).catch((error) => {
+      console.warn(`Direct search failed: ${error.message}`);
+      failures.push(`Direct search failed (${error.message})`);
       return null;
     });
 
-    if (soundcloudTrack) {
-      return soundcloudTrack;
+    if (directTrack) {
+      return directTrack;
     }
 
     // Last resort: search Lavalink directly. We still keep this honest by picking
@@ -150,59 +231,72 @@ class MusicService {
     throw new Error(`I couldn't find a song matching "${query}". Try a more specific song or artist name.`);
   }
 
-  // Direct Lavalink fallback for free-text searches. Filters the raw search results
-  // down to playable songs (using the same sanity checks as autoplay) and returns the
-  // top match, falling back to the first encoded track if none pass the filter.
-  async resolveDirectSearch(query, requester) {
-    const node = this.client.playerManager.getSearchNode();
-    // Don't swallow load failures: a YouTube error (e.g. a "confirm you're not a bot"
-    // block on the host) must surface to the caller rather than silently looking like
-    // "no results". Lavalink reports these as loadType "error" in the response body.
-    const result = await node.rest.resolve(`scsearch:${query}`);
+  // Direct fallback for free-text searches, tried on each provider in order. Only a
+  // result that is a real song AND whose title/artist shares the searched words is
+  // accepted, because raw search returns *something* for any text.
+  async resolveDirectSearch(query, requester, options = {}) {
+    const errors = [];
 
-    if (result?.loadType === "error") {
-      throw new Error(result.data?.message || "SoundCloud search returned an error.");
+    for (const provider of this.getProviders(options.skip)) {
+      let tracks;
+      try {
+        tracks = await this.searchProvider(provider, query);
+      } catch (error) {
+        errors.push(`${provider.label}: ${error.message}`);
+        continue;
+      }
+
+      const chosen = tracks.find(
+        (track) =>
+          this.autoplay.isPlayableMusicTrack(track) &&
+          !this.autoplay.isBlockedTitle(track.info?.title) &&
+          this.autoplay.isQueryRelevant(query, track.info?.title, track.info?.author)
+      );
+
+      if (!chosen) {
+        if (tracks.length > 0) {
+          console.warn(`${provider.label} search for "${query}" returned ${tracks.length} result(s), but none passed the song/relevance filters.`);
+        }
+        continue;
+      }
+
+      const queueTrack = this.createQueueTrack(chosen, requester, options.sourceLabel || provider.label);
+      this.attachFallback(queueTrack, { query }, provider, options.skip);
+
+      return {
+        type: "track",
+        source: provider.prefix,
+        title: chosen.info.title,
+        tracks: [queueTrack]
+      };
     }
 
-    const tracks = this.getLavalinkTracks(result).filter((track) => track?.encoded);
-
-    if (tracks.length === 0) {
-      return null;
+    // Only report an error when every provider errored; otherwise it's a genuine no-match.
+    if (errors.length > 0 && errors.length === this.getProviders(options.skip).length) {
+      throw new Error(errors.join("; "));
     }
 
-    // Raw YouTube search returns a video for any text, so only accept a result that
-    // is a real song AND whose title/artist actually matches the words searched for.
-    // Without this, nonsense queries quietly play an unrelated song.
-    const chosen = tracks.find(
-      (track) =>
-        this.autoplay.isPlayableMusicTrack(track) &&
-        !this.autoplay.isBlockedTitle(track.info?.title) &&
-        this.autoplay.isQueryRelevant(query, track.info?.title, track.info?.author)
-    );
-
-    if (!chosen) {
-      // Results came back but every one was filtered out as a non-song or off-topic
-      // match. Log it so an over-strict filter is visible in the host logs.
-      console.warn(`Direct search for "${query}" returned ${tracks.length} result(s), but none passed the song/relevance filters.`);
-      return null;
-    }
-
-    return {
-      type: "track",
-      source: "soundcloud",
-      title: chosen.info.title,
-      tracks: [this.createQueueTrack(chosen, requester, "SoundCloud")]
-    };
+    return null;
   }
 
   async resolveStoredTrack(song, requester) {
     const url = String(song.url || "");
     const isYouTubeUrl = /^(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\//i.test(url);
+    const youtubeEnabled = this.providers.some((provider) => provider.prefix.startsWith("yt"));
 
     try {
-      const result = await this.resolveLavalink(isYouTubeUrl ? song.title : url, requester, { allowPlaylists: false });
-      return result.tracks[0];
+      if (!url || (isYouTubeUrl && !youtubeEnabled)) {
+        throw new Error("Stored URL can't be loaded directly.");
+      }
+
+      const result = await this.resolveLavalink(url, requester, { allowPlaylists: false });
+      return this.attachFallback(result.tracks[0], { query: song.title }, { prefix: "link" });
     } catch {
+      const direct = await this.resolveDirectSearch(song.title, requester).catch(() => null);
+      if (direct) {
+        return direct.tracks[0];
+      }
+
       const result = await this.resolveLavalink(song.title, requester, { allowPlaylists: false });
       return result.tracks[0];
     }
@@ -244,7 +338,7 @@ class MusicService {
   // tag it with the canonical Spotify title/artists. Shared by direct Spotify
   // URLs and by text searches resolved through Spotify.
   async resolveCanonicalSpotifyTrack(track, requester) {
-    const firstTrack = await this.resolveSpotifyAudio(track, requester);
+    const firstTrack = await this.resolveMatchedAudio(this.spotifyToSong(track), requester, { sourceLabel: "Spotify" });
 
     if (track.artworkUrl && !firstTrack.info.artworkUrl) {
       firstTrack.info.artworkUrl = track.artworkUrl;
@@ -263,49 +357,55 @@ class MusicService {
     };
   }
 
-  // SoundCloud search always returns *something*, and its top hit is frequently an
-  // unrelated upload. Never trust result #1: search artist + title (then title alone)
-  // and only accept a result whose title really is this song, by this artist or with
-  // the same length. If nothing matches, fail rather than play the wrong song.
-  async resolveSpotifyAudio(spotifyTrack, requester) {
-    const node = this.client.playerManager.getSearchNode();
-    const searchTitle = this.stripTitleExtras(spotifyTrack.name) || spotifyTrack.name;
-    const artistNames = spotifyTrack.artists.map((artist) => artist.name).filter(Boolean);
+  // Search always returns *something*, and the top hit is frequently an unrelated
+  // upload. Never trust result #1: on each provider, search artist + title (then title
+  // alone) and only accept a result whose title really is this song, by this artist or
+  // with the same length. If nothing matches anywhere, fail rather than play the wrong song.
+  async resolveMatchedAudio(song, requester, options = {}) {
+    const searchTitle = this.stripTitleExtras(song.title) || song.title;
+    const artistNames = (song.artists || []).filter(Boolean);
     const queries = [...new Set([`${artistNames.join(" ")} ${searchTitle}`.trim(), searchTitle])];
-    let lastError = null;
+    const errors = [];
 
-    for (const query of queries) {
-      const result = await node.rest.resolve(`scsearch:${query}`).catch((error) => {
-        lastError = error;
-        return null;
-      });
+    for (const provider of this.getProviders(options.skip)) {
+      for (const query of queries) {
+        let tracks;
+        try {
+          tracks = await this.searchProvider(provider, query);
+        } catch (error) {
+          errors.push(`${provider.label}: ${error.message}`);
+          break;
+        }
 
-      if (result?.loadType === "error") {
-        lastError = new Error(result.data?.message || "SoundCloud search returned an error.");
-        continue;
+        const best = tracks
+          .map((candidate) => ({ candidate, score: this.scoreCandidate(candidate, song, searchTitle, artistNames) }))
+          .filter((entry) => entry.score > 0)
+          .sort((a, b) => b.score - a.score)[0];
+
+        if (best) {
+          const queueTrack = this.createQueueTrack(best.candidate, requester, options.sourceLabel || provider.label);
+          return this.attachFallback(queueTrack, song, provider, options.skip);
+        }
       }
-
-      const best = this.getLavalinkTracks(result)
-        .filter((candidate) => candidate?.encoded)
-        .map((candidate) => ({ candidate, score: this.scoreSpotifyCandidate(candidate, spotifyTrack, searchTitle, artistNames) }))
-        .filter((entry) => entry.score > 0)
-        .sort((a, b) => b.score - a.score)[0];
-
-      if (best) {
-        return this.createQueueTrack(best.candidate, requester, "Spotify");
-      }
-    }
-
-    if (lastError) {
-      throw lastError;
     }
 
     const byLine = artistNames.length > 0 ? ` by ${artistNames.join(", ")}` : "";
-    throw new Error(`Couldn't find "${spotifyTrack.name}"${byLine} on SoundCloud.`);
+    const searched = this.getProviders(options.skip).map((provider) => provider.label).join(", ");
+    throw new Error(
+      `Couldn't find "${song.title}"${byLine} on ${searched || "any provider"}.` + (errors.length > 0 ? ` (${errors.join("; ")})` : "")
+    );
+  }
+
+  spotifyToSong(spotifyTrack) {
+    return {
+      title: spotifyTrack.name,
+      artists: spotifyTrack.artists.map((artist) => artist.name).filter(Boolean),
+      durationMs: spotifyTrack.duration
+    };
   }
 
   // Returns 0 when the candidate is not this song, otherwise a positive score.
-  scoreSpotifyCandidate(candidate, spotifyTrack, searchTitle, artistNames) {
+  scoreCandidate(candidate, song, searchTitle, artistNames) {
     const autoplay = this.autoplay;
     const info = candidate.info || {};
 
@@ -329,25 +429,25 @@ class MusicService {
     }
 
     // Don't swap a studio song for a remix/cover/live take unless that is what Spotify has.
-    const spotifyTitle = String(spotifyTrack.name || "").toLowerCase();
+    const songTitle = String(song.title || "").toLowerCase();
     const extraVariant = ["remix", "cover", "live", "slowed", "reverb", "sped up", "nightcore", "8d", "instrumental", "karaoke"].find(
-      (word) => new RegExp(`\\b${word}\\b`, "i").test(info.title || "") && !spotifyTitle.includes(word)
+      (word) => new RegExp(`\\b${word}\\b`, "i").test(info.title || "") && !songTitle.includes(word)
     );
 
     if (extraVariant) {
       return 0;
     }
 
-    // Duration: SoundCloud serves 30s previews for Go+ tracks and many re-uploads differ in
-    // length. Reject anything clearly not the same recording.
-    const expected = Number(spotifyTrack.duration);
+    // Duration: SoundCloud serves 30s previews for Go+ tracks, and music videos often
+    // carry intros/outros. Reject anything clearly not the same recording.
+    const expected = Number(song.durationMs);
     const actual = Number(info.length);
     let durationDiff = null;
 
     if (Number.isFinite(expected) && expected > 0 && Number.isFinite(actual) && actual > 0) {
       durationDiff = Math.abs(expected - actual);
 
-      if (durationDiff > Math.max(15000, expected * 0.15)) {
+      if (durationDiff > Math.max(20000, expected * 0.15)) {
         return 0;
       }
     }
@@ -440,7 +540,7 @@ class MusicService {
         SPOTIFY_RESOLVE_CONCURRENCY,
         async (track) => {
           try {
-            const firstTrack = await this.resolveSpotifyAudio(track, requester);
+            const firstTrack = await this.resolveMatchedAudio(this.spotifyToSong(track), requester, { sourceLabel: "Spotify" });
 
             if (track.artworkUrl && !firstTrack.info.artworkUrl) {
               firstTrack.info.artworkUrl = track.artworkUrl;
@@ -501,10 +601,30 @@ class MusicService {
     };
   }
 
+  // Loads a URL directly, or runs a plain text search on each provider in order and
+  // takes the first provider that returns anything.
   async resolveLavalink(query, requester, options = {}) {
+    if (!this.isUrl(query)) {
+      const errors = [];
+
+      for (const provider of this.getProviders(options.skip)) {
+        try {
+          return await this.loadLavalinkIdentifier(`${provider.prefix}:${query}`, requester, options, provider.label);
+        } catch (error) {
+          errors.push(`${provider.label}: ${error.message}`);
+        }
+      }
+
+      throw new Error(errors.length > 0 ? errors.join("; ") : "No matches were found for that query.");
+    }
+
+    return this.loadLavalinkIdentifier(query, requester, options, "Link");
+  }
+
+  async loadLavalinkIdentifier(identifier, requester, options, defaultLabel) {
     const node = this.client.playerManager.getSearchNode();
-    const identifier = this.isUrl(query) ? query : `scsearch:${query}`;
     const result = await node.rest.resolve(identifier);
+    const label = options.sourceLabel || defaultLabel;
 
     if (!result) {
       throw new Error("Lavalink did not return a search result.");
@@ -525,11 +645,9 @@ class MusicService {
 
       return {
         type: "playlist",
-        source: "soundcloud",
+        source: label.toLowerCase(),
         title: result.data.info.name,
-        tracks: result.data.tracks.map((track) =>
-          this.createQueueTrack(track, requester, options.sourceLabel || "SoundCloud")
-        )
+        tracks: result.data.tracks.map((track) => this.createQueueTrack(track, requester, label))
       };
     }
 
@@ -541,9 +659,9 @@ class MusicService {
 
     return {
       type: "track",
-      source: options.sourceLabel?.toLowerCase() || "soundcloud",
+      source: label.toLowerCase(),
       title: rawTrack.info.title,
-      tracks: [this.createQueueTrack(rawTrack, requester, options.sourceLabel || "SoundCloud")]
+      tracks: [this.createQueueTrack(rawTrack, requester, label)]
     };
   }
 }

@@ -242,6 +242,13 @@ class PlayerManager {
         return;
       }
 
+      // Lavalink sends "exception" and then "end" (loadFailed) for the same failure.
+      // Both go through handleTrackFailure, which acts once per track.
+      if (event.reason === "loadFailed") {
+        await this.handleTrackFailure(state, event.track?.encoded);
+        return;
+      }
+
       this.clearPlaybackStartTimer(state);
       await this.advanceQueue(state.guildId).catch((error) => this.handleAdvanceError(state, error));
     });
@@ -257,20 +264,70 @@ class PlayerManager {
     });
 
     player.on("exception", async (event) => {
-      this.clearPlaybackStartTimer(state);
       console.error(`Playback exception in guild ${state.guildId}:`, event.exception);
-      state.skipLoopOnce = true;
-      await this.sendToTextChannel(
-        state.textChannelId,
-        { embeds: [createErrorEmbed("Lavalink reported a playback exception. I tried to keep the queue moving.", "Playback issue")] }
-      );
-      await this.advanceQueue(state.guildId).catch((error) => this.handleAdvanceError(state, error));
+      await this.handleTrackFailure(state, event.track?.encoded);
     });
 
     player.on("closed", async () => {
       this.clearPlaybackStartTimer(state);
       await this.destroy(state.guildId, "The voice connection closed, so I cleaned up the player.");
     });
+  }
+
+  // The current track failed to load or play. Try the same song on the next provider
+  // before giving up and moving on to the next queued track.
+  async handleTrackFailure(state, encoded) {
+    const track = state.current;
+
+    if (!track || (encoded && track.encoded !== encoded) || track.failureHandled) {
+      return;
+    }
+
+    track.failureHandled = true;
+    this.clearPlaybackStartTimer(state);
+
+    if ((await this.tryProviderFailover(state, track)) || state.current !== track) {
+      return;
+    }
+
+    state.skipLoopOnce = true;
+    await this.sendToTextChannel(
+      state.textChannelId,
+      { embeds: [createErrorEmbed(`I couldn't play **${track.info?.title || "that track"}** from any provider, so I skipped it.`, "Playback issue")] }
+    );
+    await this.advanceQueue(state.guildId).catch((error) => this.handleAdvanceError(state, error));
+  }
+
+  async tryProviderFailover(state, track) {
+    const replacement = await this.client.music.resolveAlternative(track).catch((error) => {
+      console.warn(`Provider failover failed for "${track.info?.title}": ${error.message}`);
+      return null;
+    });
+
+    // The user may have skipped or stopped while we were searching.
+    if (!replacement || state.current !== track || this.getState(state.guildId) !== state) {
+      return false;
+    }
+
+    const fromLabel = this.client.music.getProviderLabel(track.provider);
+    const toLabel = this.client.music.getProviderLabel(replacement.provider);
+    console.warn(`Track "${track.info?.title}" failed on ${fromLabel}; retrying on ${toLabel} in guild ${state.guildId}.`);
+
+    state.current = replacement;
+    state.isPaused = false;
+
+    try {
+      await this.playCurrentTrack(state);
+    } catch (error) {
+      console.error(`Failed to start failover track in guild ${state.guildId}:`, error);
+      return false;
+    }
+
+    await this.sendToTextChannel(
+      state.textChannelId,
+      { embeds: [createInfoEmbed(`${fromLabel} couldn't stream **${track.info?.title || "that track"}**, so I switched to ${toLabel}.`)] }
+    );
+    return true;
   }
 
   buildLoopTrack(track) {
@@ -280,6 +337,10 @@ class PlayerManager {
       info: { ...track.info },
       requester: { ...track.requester },
       sourceLabel: track.sourceLabel,
+      provider: track.provider,
+      fallback: track.fallback
+        ? { ...track.fallback, artists: [...(track.fallback.artists || [])], tried: [...(track.fallback.tried || [])] }
+        : undefined,
       canonical: track.canonical
         ? {
             title: track.canonical.title,
@@ -541,8 +602,19 @@ class PlayerManager {
       return;
     }
 
-    console.warn(`Playback did not start within ${PLAYBACK_START_TIMEOUT_MS}ms in guild ${guildId}; skipping ${track.info?.title || "unknown track"}.`);
+    console.warn(`Playback did not start within ${PLAYBACK_START_TIMEOUT_MS}ms in guild ${guildId}: ${track.info?.title || "unknown track"}.`);
     this.clearPlaybackStartTimer(state);
+
+    // An exception for this track is already being handled (failover in progress).
+    if (track.failureHandled) {
+      return;
+    }
+
+    track.failureHandled = true;
+    if ((await this.tryProviderFailover(state, track)) || state.current !== track) {
+      return;
+    }
+
     state.skipLoopOnce = true;
     state.current = null;
     state.isPaused = false;

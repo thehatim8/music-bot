@@ -452,17 +452,27 @@ class AutoplayService {
     return queries.slice(0, broaden ? 10 : 6);
   }
 
+  // Tries every query on the first provider, then the next provider, so a provider
+  // that is down or has a thin catalogue doesn't stop autoplay.
   async resolveLavalinkFallback(queries, requester, context, options = {}) {
-    const node = this.client.playerManager.getSearchNode();
+    for (const provider of this.music.getProviders()) {
+      const track = await this.resolveProviderFallback(provider, queries, requester, context, options);
+      if (track) {
+        return track;
+      }
+    }
 
+    return null;
+  }
+
+  async resolveProviderFallback(provider, queries, requester, context, options) {
     for (const query of queries) {
-      const result = await node.rest.resolve(`scsearch:${query}`).catch(() => null);
-      if (!result) {
+      const results = await this.music.searchProvider(provider, query).catch(() => null);
+      if (!results) {
         continue;
       }
 
-      const candidates = this.music
-        .getLavalinkTracks(result)
+      const candidates = results
         .map((rawTrack) => this.normalizeLavalinkTrack(rawTrack))
         .filter(Boolean)
         .filter((candidate) => {
@@ -491,8 +501,12 @@ class AutoplayService {
           continue;
         }
 
-        this.decorateTrackForAutoplay(queueTrack, candidate, context, "soundcloud");
-        return queueTrack;
+        this.decorateTrackForAutoplay(queueTrack, candidate, context, provider.prefix);
+        return this.music.attachFallback(
+          queueTrack,
+          { title: candidate.title, artists: this.getArtistNames(candidate), durationMs: candidate.rawTrack.info?.length },
+          provider
+        );
       }
     }
 
