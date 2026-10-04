@@ -42,6 +42,10 @@ ytmusic = YTMusic()
 stream_cache = {}
 stream_locks = {}
 stream_locks_guard = threading.Lock()
+# One shared yt-dlp instance keeps YouTube's solved player script in memory, which
+# makes every extraction after the first ~1.5s faster. It isn't thread-safe, hence the lock.
+ydl = yt_dlp.YoutubeDL(YDL_OPTIONS)
+ydl_lock = threading.Lock()
 
 
 def normalize_artist_entry(artist):
@@ -258,7 +262,7 @@ def upstream_request(stream, start, end=None):
 
 
 def extract_stream(video_id):
-    with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
+    with ydl_lock:
         info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
 
     if not info.get("url"):

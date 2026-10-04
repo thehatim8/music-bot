@@ -109,6 +109,24 @@ class MusicService {
     return track;
   }
 
+  // Starts loading a yt-dlp track's audio in the background so it is ready (or
+  // nearly ready) when it's time to play. Safe to call more than once.
+  prepareStream(track) {
+    if (!track?.ytdlp || track.encoded) {
+      return Promise.resolve(track);
+    }
+
+    if (!track.streamLoad) {
+      track.streamLoad = this.loadStreamTrack(track).catch((error) => {
+        track.streamLoad = null;
+        throw error;
+      });
+      track.streamLoad.catch(() => {});
+    }
+
+    return track.streamLoad;
+  }
+
   isYouTubeVideoUrl(input) {
     return this.autoplay.extractVideoId(input);
   }
@@ -220,7 +238,9 @@ class MusicService {
     const spotifyTarget = this.spotify.parseSpotifyUrl(query);
 
     if (spotifyTarget?.type === "track") {
-      return this.resolveSpotifyTrack(query, requester);
+      const result = await this.resolveSpotifyTrack(query, requester);
+      this.prepareStream(result.tracks[0]).catch(() => {});
+      return result;
     }
 
     if (spotifyTarget?.type === "playlist") {
@@ -231,11 +251,16 @@ class MusicService {
       return this.resolveSpotifyPlaylist(query, requester, options);
     }
 
-    if (!this.isUrl(query)) {
-      return this.resolveTextQuery(query, requester);
+    const result = !this.isUrl(query)
+      ? await this.resolveTextQuery(query, requester)
+      : await this.resolveLavalink(query, requester, { allowPlaylists, sourceLabel: options.sourceLabel });
+
+    // Overlap the audio load with joining the voice channel.
+    if (result?.type === "track") {
+      this.prepareStream(result.tracks[0]).catch(() => {});
     }
 
-    return this.resolveLavalink(query, requester, { allowPlaylists, sourceLabel: options.sourceLabel });
+    return result;
   }
 
   // Free-text searches (e.g. `/play random stuff`) must only ever produce real

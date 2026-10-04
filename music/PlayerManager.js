@@ -218,6 +218,9 @@ class PlayerManager {
       this.clearIdleTimer(state);
       state.isPaused = false;
 
+      // Get the next song's audio ready while this one plays.
+      this.client.music.prepareStream(state.queue[0]).catch(() => {});
+
       if (state.suppressNextStartMessage) {
         state.suppressNextStartMessage = false;
         return;
@@ -575,7 +578,7 @@ class PlayerManager {
     // yt-dlp tracks are only loaded into Lavalink right before they play.
     if (!track.encoded && track.ytdlp) {
       try {
-        await this.client.music.loadStreamTrack(track);
+        await this.client.music.prepareStream(track);
       } catch (error) {
         console.warn(`Failed to load YouTube audio for "${track.info?.title}" in guild ${state.guildId}: ${error.message}`);
         if (state.current === track) {
