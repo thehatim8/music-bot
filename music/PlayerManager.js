@@ -317,7 +317,10 @@ class PlayerManager {
     state.isPaused = false;
 
     try {
-      await this.playCurrentTrack(state);
+      // false means the replacement failed too and that failure was already handled.
+      if (!(await this.playCurrentTrack(state))) {
+        return true;
+      }
     } catch (error) {
       console.error(`Failed to start failover track in guild ${state.guildId}:`, error);
       return false;
@@ -338,6 +341,7 @@ class PlayerManager {
       requester: { ...track.requester },
       sourceLabel: track.sourceLabel,
       provider: track.provider,
+      ytdlp: track.ytdlp,
       fallback: track.fallback
         ? { ...track.fallback, artists: [...(track.fallback.artists || [])], tried: [...(track.fallback.tried || [])] }
         : undefined,
@@ -567,6 +571,24 @@ class PlayerManager {
 
     const track = state.current;
     this.clearPlaybackStartTimer(state);
+
+    // yt-dlp tracks are only loaded into Lavalink right before they play.
+    if (!track.encoded && track.ytdlp) {
+      try {
+        await this.client.music.loadStreamTrack(track);
+      } catch (error) {
+        console.warn(`Failed to load YouTube audio for "${track.info?.title}" in guild ${state.guildId}: ${error.message}`);
+        if (state.current === track) {
+          await this.handleTrackFailure(state, null);
+        }
+        return false;
+      }
+
+      if (state.current !== track) {
+        return false;
+      }
+    }
+
     await this.prepareAudioOutput(state.player);
     state.playbackStartRequestedAt = Date.now();
     state.playbackStartTimer = setTimeout(() => {

@@ -45,13 +45,20 @@ module.exports = {
   search: {
     // Lavalink search prefixes, tried in order. A song that fails to resolve or to
     // play on one provider is retried on the next.
-    providers: (process.env.SEARCH_PROVIDERS || "ytmsearch,ytsearch,scsearch")
+    // "ytdlp" is YouTube played through yt-dlp (services/ytmusic_autoplay.py) instead of
+    // Lavalink's YouTube plugin.
+    providers: (process.env.SEARCH_PROVIDERS || "ytdlp,ytmsearch,ytsearch,scsearch")
       .split(",")
       .map((value) => value.trim())
       .filter(Boolean)
   },
   ytmusicAutoplay: {
     url: process.env.YTMUSIC_AUTOPLAY_URL?.trim() || "http://127.0.0.1:3001"
+  },
+  ytdlp: {
+    // Address Lavalink uses to fetch audio from the Python service. Only differs from
+    // YTMUSIC_AUTOPLAY_URL when Lavalink runs on another machine.
+    streamUrl: process.env.YTDLP_STREAM_URL?.trim() || process.env.YTMUSIC_AUTOPLAY_URL?.trim() || "http://127.0.0.1:3001"
   },
   defaultPrefix: process.env.DEFAULT_PREFIX?.trim() || DEFAULT_PREFIX
 };

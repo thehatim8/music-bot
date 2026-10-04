@@ -725,7 +725,7 @@ class AutoplayService {
   }
 
   normalizeLavalinkTrack(rawTrack) {
-    if (!rawTrack?.encoded || !rawTrack.info?.title || !this.isPlayableMusicTrack(rawTrack)) {
+    if ((!rawTrack?.encoded && !rawTrack?.ytdlp) || !rawTrack.info?.title || !this.isPlayableMusicTrack(rawTrack)) {
       return null;
     }
 

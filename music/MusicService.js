@@ -4,6 +4,7 @@ const { SPOTIFY_RESOLVE_BATCH_SIZE, SPOTIFY_RESOLVE_CONCURRENCY } = require("../
 const { mapWithConcurrency } = require("../utils/async");
 
 const PROVIDER_LABELS = Object.freeze({
+  ytdlp: "YouTube",
   ytmsearch: "YouTube Music",
   ytsearch: "YouTube",
   scsearch: "SoundCloud",
@@ -18,6 +19,7 @@ class MusicService {
     this.client = client;
     this.spotify = new SpotifyService(client.config);
     this.autoplay = new AutoplayService(this);
+    this.streamServiceUrl = client.config.ytdlp?.streamUrl || client.config.ytmusicAutoplay?.url;
     this.providers = (client.config.search?.providers?.length ? client.config.search.providers : ["scsearch"]).map((prefix) => ({
       prefix,
       label: PROVIDER_LABELS[prefix] || prefix
@@ -35,6 +37,10 @@ class MusicService {
   // Runs one search on one provider. Load errors are thrown so callers can record
   // them and move on to the next provider.
   async searchProvider(provider, query) {
+    if (provider.prefix === "ytdlp") {
+      return this.searchYtdlp(query);
+    }
+
     const node = this.client.playerManager.getSearchNode();
     const result = await node.rest.resolve(`${provider.prefix}:${query}`);
 
@@ -43,6 +49,68 @@ class MusicService {
     }
 
     return this.getLavalinkTracks(result).filter((track) => track?.encoded);
+  }
+
+  // YouTube Music search through the Python service. Results are not loaded into
+  // Lavalink until they are about to play (see loadStreamTrack).
+  async searchYtdlp(query) {
+    const tracks = await this.autoplay.fetchSearch(query);
+    return tracks.filter((track) => track?.videoId && track.title).map((track) => this.createYtdlpRawTrack(track));
+  }
+
+  createYtdlpRawTrack(track) {
+    const artists = (track.artists || []).map((artist) => artist?.name || artist).filter(Boolean);
+
+    return {
+      encoded: null,
+      ytdlp: { videoId: track.videoId },
+      info: {
+        identifier: track.videoId,
+        title: track.title,
+        author: artists.join(", ") || track.artist || "Unknown artist",
+        length: Number(track.durationMs) || 0,
+        isStream: Boolean(track.isLive),
+        isSeekable: !track.isLive,
+        uri: `https://www.youtube.com/watch?v=${track.videoId}`,
+        artworkUrl: track.artworkUrl || null,
+        sourceName: "youtube"
+      },
+      pluginInfo: {}
+    };
+  }
+
+  async fetchYtdlpInfo(videoId) {
+    const url = new URL("/info", this.streamServiceUrl);
+    url.searchParams.set("videoId", videoId);
+    const response = await fetch(url, { signal: AbortSignal.timeout(30000) });
+    const payload = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw new Error(payload.error || `YouTube info request failed (HTTP ${response.status}).`);
+    }
+
+    return payload;
+  }
+
+  // Lavalink plays the service's /audio URL as a plain HTTP source, so YouTube
+  // playback doesn't depend on Lavalink's YouTube plugin.
+  async loadStreamTrack(track) {
+    const url = new URL("/audio", this.streamServiceUrl);
+    url.searchParams.set("videoId", track.ytdlp.videoId);
+    const node = this.client.playerManager.getSearchNode();
+    const result = await node.rest.resolve(url.toString());
+
+    if (result?.loadType !== "track" || !result.data?.encoded) {
+      throw new Error(result?.data?.message || "Lavalink could not load the YouTube audio stream.");
+    }
+
+    track.raw = result.data;
+    track.encoded = result.data.encoded;
+    return track;
+  }
+
+  isYouTubeVideoUrl(input) {
+    return this.autoplay.extractVideoId(input);
   }
 
   // Information needed to find the same song again on another provider if this
@@ -105,6 +173,7 @@ class MusicService {
     const track = {
       raw: rawTrack,
       encoded: rawTrack.encoded,
+      ytdlp: rawTrack.ytdlp,
       info: {
         ...rawTrack.info,
         artworkUrl,
@@ -283,6 +352,14 @@ class MusicService {
     const url = String(song.url || "");
     const isYouTubeUrl = /^(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\//i.test(url);
     const youtubeEnabled = this.providers.some((provider) => provider.prefix.startsWith("yt"));
+    const storedVideoId = this.hasProvider("ytdlp") && isYouTubeUrl ? this.isYouTubeVideoUrl(url) : null;
+
+    if (storedVideoId) {
+      const track = await this.resolveYtdlpVideo(storedVideoId, requester).catch(() => null);
+      if (track) {
+        return this.attachFallback(track, { query: song.title }, { prefix: "ytdlp" });
+      }
+    }
 
     try {
       if (!url || (isYouTubeUrl && !youtubeEnabled)) {
@@ -618,7 +695,39 @@ class MusicService {
       throw new Error(errors.length > 0 ? errors.join("; ") : "No matches were found for that query.");
     }
 
+    const videoId = this.hasProvider("ytdlp") ? this.isYouTubeVideoUrl(query) : null;
+    if (videoId && !/[?&]list=/.test(query)) {
+      const track = await this.resolveYtdlpVideo(videoId, requester, options.sourceLabel).catch((error) => {
+        console.warn(`yt-dlp could not load ${videoId}: ${error.message}`);
+        return null;
+      });
+
+      if (track) {
+        this.attachFallback(track, { query: track.info.title }, { prefix: "ytdlp" });
+        return { type: "track", source: "youtube", title: track.info.title, tracks: [track] };
+      }
+    }
+
     return this.loadLavalinkIdentifier(query, requester, options, "Link");
+  }
+
+  hasProvider(prefix) {
+    return this.providers.some((provider) => provider.prefix === prefix);
+  }
+
+  async resolveYtdlpVideo(videoId, requester, sourceLabel = "YouTube") {
+    const info = await this.fetchYtdlpInfo(videoId);
+    const rawTrack = this.createYtdlpRawTrack({
+      videoId,
+      title: info.title,
+      artist: info.artist,
+      durationMs: info.durationMs,
+      artworkUrl: info.artworkUrl,
+      isLive: info.isLive
+    });
+    const track = this.createQueueTrack(rawTrack, requester, sourceLabel);
+    track.provider = "ytdlp";
+    return track;
   }
 
   async loadLavalinkIdentifier(identifier, requester, options, defaultLabel) {

@@ -192,6 +192,14 @@ lavalink:
 
 After starting Lavalink, confirm it is listening on the same host, port, and password as your `.env` values.
 
+### YouTube via yt-dlp (recommended)
+
+The `ytdlp` search provider (first in the default `SEARCH_PROVIDERS`) plays YouTube without Lavalink's YouTube plugin. The Python service (`services/ytmusic_autoplay.py`) finds the audio with yt-dlp and serves it at `/audio?videoId=...`; Lavalink plays that URL as a normal HTTP source.
+
+- `pip install -r services/requirements.txt` (keep yt-dlp updated: `pip install -U "yt-dlp[default]"`).
+- Lavalink needs `sources.http: true` and must be able to reach the service. If Lavalink runs on another machine, start the service with `YTMUSIC_AUTOPLAY_HOST=0.0.0.0` and set `YTDLP_STREAM_URL` in `.env` to an address Lavalink can reach.
+- Optional: `YTDLP_COOKIES=/path/to/cookies.txt` if YouTube asks the service to sign in.
+
 ### Important YouTube Notes
 
 - Use the official client list above. If your current config contains `TVHTML5_SIMPLY`, replace it with `WEBEMBEDDED`.
