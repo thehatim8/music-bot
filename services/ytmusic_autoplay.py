@@ -1,14 +1,15 @@
 import json
 import os
 import re
+import shutil
 import threading
 import time
-import urllib.error
-import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import yt_dlp
+from yt_dlp.networking import Request as YdlRequest
+from yt_dlp.networking.exceptions import HTTPError as YdlHTTPError
 from ytmusicapi import YTMusic
 
 
@@ -25,18 +26,33 @@ UPSTREAM_TIMEOUT = 20
 VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
 CONTENT_TYPES = {"webm": "audio/webm", "m4a": "audio/mp4", "mp4": "audio/mp4"}
 
-YDL_OPTIONS = {
-    "format": "bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio/best",
+# YouTube's player challenges need a JS runtime. Without one yt-dlp still returns a URL,
+# but YouTube answers 403 when it's downloaded. pm2 may not have node on PATH, so look
+# in the usual places too (NODE_PATH_BIN overrides).
+NODE_BIN = os.getenv("NODE_PATH_BIN") or shutil.which("node") or next(
+    (path for path in ("/usr/bin/node", "/usr/local/bin/node") if os.path.exists(path)), None
+)
+
+# Same networking defaults for extraction and download, so the download comes from the
+# same place YouTube signed the URL for.
+BASE_OPTIONS = {
     "quiet": True,
-    "no_warnings": True,
+    "no_warnings": False,
+}
+
+YDL_OPTIONS = {
+    **BASE_OPTIONS,
+    "format": "bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio/best",
     "noplaylist": True,
     "skip_download": True,
-    # YouTube's player challenges need a JS runtime; node is already installed for the bot.
-    "js_runtimes": {"deno": {"path": None}, "node": {"path": None}},
+    "js_runtimes": {"deno": {"path": None}, "node": {"path": NODE_BIN}},
 }
 
 if os.getenv("YTDLP_COOKIES"):
     YDL_OPTIONS["cookiefile"] = os.getenv("YTDLP_COOKIES")
+
+if not NODE_BIN:
+    print("WARNING: node was not found, YouTube downloads will likely fail with 403. Set NODE_PATH_BIN.", flush=True)
 
 ytmusic = YTMusic()
 stream_cache = {}
@@ -254,11 +270,17 @@ def stream_lock(video_id):
         return stream_locks.setdefault(video_id, threading.Lock())
 
 
-def upstream_request(stream, start, end=None):
+# Downloads go through yt-dlp's own HTTP stack (the one its downloader uses). A
+# separate instance per request because the shared one is busy extracting.
+def new_downloader():
+    return yt_dlp.YoutubeDL(BASE_OPTIONS)
+
+
+def upstream_request(downloader, stream, start, end=None):
     headers = dict(stream["headers"])
     headers["Range"] = f"bytes={start}-{'' if end is None else end}"
-    request = urllib.request.Request(stream["url"], headers=headers)
-    return urllib.request.urlopen(request, timeout=UPSTREAM_TIMEOUT)
+    request = YdlRequest(stream["url"], headers=headers, extensions={"timeout": UPSTREAM_TIMEOUT})
+    return downloader.urlopen(request)
 
 
 def extract_stream(video_id):
@@ -282,9 +304,13 @@ def extract_stream(video_id):
     }
 
     if not stream["size"]:
-        with upstream_request(stream, 0, 0) as response:
-            content_range = response.headers.get("Content-Range") or ""
-            stream["size"] = int(content_range.rsplit("/", 1)[-1]) if "/" in content_range else None
+        with new_downloader() as downloader:
+            response = upstream_request(downloader, stream, 0, 0)
+            try:
+                content_range = response.get_header("Content-Range") or ""
+                stream["size"] = int(content_range.rsplit("/", 1)[-1]) if "/" in content_range else None
+            finally:
+                response.close()
 
     return stream
 
@@ -408,48 +434,69 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         start, end = byte_range or (0, size - 1)
-        self.send_response(206 if byte_range else 200)
-        self.send_header("Content-Type", CONTENT_TYPES.get(stream["ext"], "application/octet-stream"))
-        self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Content-Length", str(end - start + 1))
-        if byte_range:
-            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-        self.end_headers()
 
-        if not send_body:
-            return
+        with new_downloader() as downloader:
+            # Open the first chunk before answering, so a YouTube refusal becomes a clear
+            # 502 for Lavalink instead of an empty "successful" stream.
+            try:
+                stream, response = self.open_chunk(downloader, video_id, stream, start, end)
+            except Exception as error:
+                print(f"YouTube refused audio for {video_id}: {error}", flush=True)
+                self.send_json(502, {"error": str(error) or "YouTube refused the audio request"})
+                return
 
-        position = start
-        refreshed = False
+            self.send_response(206 if byte_range else 200)
+            self.send_header("Content-Type", CONTENT_TYPES.get(stream["ext"], "application/octet-stream"))
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(end - start + 1))
+            if byte_range:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.end_headers()
 
-        try:
-            while position <= end:
-                chunk_end = min(position + STREAM_CHUNK_SIZE - 1, end)
-                chunk_start = position
-                try:
-                    with upstream_request(stream, position, chunk_end) as response:
+            if not send_body:
+                response.close()
+                return
+
+            position = start
+
+            try:
+                while True:
+                    chunk_start = position
+                    try:
                         while True:
                             data = response.read(64 * 1024)
                             if not data:
                                 break
                             self.wfile.write(data)
                             position += len(data)
-                except urllib.error.HTTPError as error:
-                    # The signed URL expired or was revoked; extract a fresh one once.
-                    if error.code in (403, 410) and not refreshed:
-                        refreshed = True
-                        stream = get_stream(video_id, refresh=True)
-                        continue
-                    raise
+                    finally:
+                        response.close()
 
-                # A short read just resumes from where it stopped; no data at all is fatal.
-                if position == chunk_start:
-                    raise RuntimeError("upstream returned no data")
-        except (BrokenPipeError, ConnectionResetError):
-            return
-        except Exception as error:
-            print(f"Audio stream for {video_id} stopped at byte {position}: {error}", flush=True)
-            self.close_connection = True
+                    # A short read just resumes from where it stopped; no data at all is fatal.
+                    if position == chunk_start:
+                        raise RuntimeError("upstream returned no data")
+
+                    if position > end:
+                        break
+
+                    stream, response = self.open_chunk(downloader, video_id, stream, position, end)
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except Exception as error:
+                print(f"Audio stream for {video_id} stopped at byte {position}: {error}", flush=True)
+                self.close_connection = True
+
+    # Opens one upstream chunk. If the signed URL was expired or revoked, extracts a
+    # fresh one and tries once more.
+    def open_chunk(self, downloader, video_id, stream, start, end):
+        chunk_end = min(start + STREAM_CHUNK_SIZE - 1, end)
+        try:
+            return stream, upstream_request(downloader, stream, start, chunk_end)
+        except YdlHTTPError as error:
+            if error.status not in (403, 410):
+                raise
+            stream = get_stream(video_id, refresh=True)
+            return stream, upstream_request(downloader, stream, start, chunk_end)
 
     def log_message(self, format, *args):
         return

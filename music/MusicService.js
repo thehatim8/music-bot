@@ -188,10 +188,17 @@ class MusicService {
 
   createQueueTrack(rawTrack, requester, sourceLabel, canonical = null) {
     const artworkUrl = rawTrack.info.artworkUrl || rawTrack.pluginInfo?.artworkUrl || null;
+    // YouTube results from Lavalink (search, playlists) are still played through yt-dlp:
+    // Lavalink's own YouTube playback gets bot-checked on the VPS.
+    const lavalinkVideoId =
+      !rawTrack.ytdlp && rawTrack.info.sourceName === "youtube" && this.hasProvider("ytdlp")
+        ? this.autoplay.cleanVideoId(rawTrack.info.identifier)
+        : null;
+    const ytdlp = rawTrack.ytdlp || (lavalinkVideoId ? { videoId: lavalinkVideoId } : undefined);
     const track = {
       raw: rawTrack,
-      encoded: rawTrack.encoded,
-      ytdlp: rawTrack.ytdlp,
+      encoded: ytdlp ? null : rawTrack.encoded,
+      ytdlp,
       info: {
         ...rawTrack.info,
         artworkUrl,
