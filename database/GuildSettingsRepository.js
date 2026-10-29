@@ -1,10 +1,16 @@
 const createSupabase = require("./supabase");
 
+// The prefix is looked up before every prefix command, so an unreachable database must
+// not hold commands up: give up fast and use the default prefix for a while.
+const PREFIX_LOOKUP_TIMEOUT_MS = 3000;
+const PREFIX_RETRY_AFTER_MS = 5 * 60 * 1000;
+
 class GuildSettingsRepository {
   constructor(config) {
     this.supabase = createSupabase(config);
     this.defaultPrefix = config.defaultPrefix;
     this.cache = new Map();
+    this.fallbackUntil = new Map();
   }
 
   formatDatabaseError(action, error) {
@@ -31,15 +37,20 @@ class GuildSettingsRepository {
   }
 
   async getPrefix(guildId) {
-    try {
-      if (this.cache.has(guildId)) {
-        return this.cache.get(guildId);
-      }
+    if (this.cache.has(guildId)) {
+      return this.cache.get(guildId);
+    }
 
+    if ((this.fallbackUntil.get(guildId) || 0) > Date.now()) {
+      return this.defaultPrefix;
+    }
+
+    try {
       const { data, error } = await this.supabase
         .from("guild_settings")
         .select("prefix")
         .eq("guild_id", guildId)
+        .abortSignal(AbortSignal.timeout(PREFIX_LOOKUP_TIMEOUT_MS))
         .maybeSingle();
 
       if (error) {
@@ -48,8 +59,10 @@ class GuildSettingsRepository {
 
       const prefix = data?.prefix || this.defaultPrefix;
       this.cache.set(guildId, prefix);
+      this.fallbackUntil.delete(guildId);
       return prefix;
     } catch (error) {
+      this.fallbackUntil.set(guildId, Date.now() + PREFIX_RETRY_AFTER_MS);
       throw new Error(this.formatDatabaseError("fetch guild prefix", error));
     }
   }
