@@ -1,5 +1,16 @@
 const createSupabase = require("./supabase");
 
+function toPlaylistSummary(playlist) {
+  return {
+    id: playlist.id,
+    userId: playlist.user_id,
+    name: playlist.name,
+    isPublic: playlist.is_public,
+    createdAt: playlist.created_at,
+    songCount: Array.isArray(playlist.playlist_songs) ? playlist.playlist_songs.length : 0
+  };
+}
+
 class PlaylistRepository {
   constructor(config) {
     this.supabase = createSupabase(config);
@@ -112,7 +123,7 @@ class PlaylistRepository {
     try {
       const { data, error } = await this.supabase
         .from("playlists")
-        .select("id, name, is_public, created_at, playlist_songs(id)")
+        .select("id, user_id, name, is_public, created_at, playlist_songs(id)")
         .eq("user_id", userId)
         .order("created_at", { ascending: true });
 
@@ -120,13 +131,25 @@ class PlaylistRepository {
         throw new Error(this.formatDatabaseError("list playlists", error));
       }
 
-      return data.map((playlist) => ({
-        id: playlist.id,
-        name: playlist.name,
-        isPublic: playlist.is_public,
-        createdAt: playlist.created_at,
-        songCount: Array.isArray(playlist.playlist_songs) ? playlist.playlist_songs.length : 0
-      }));
+      return data.map(toPlaylistSummary);
+    } catch (error) {
+      throw new Error(this.formatDatabaseError("list playlists", error));
+    }
+  }
+
+  // Every user's playlists; the caller narrows them down to one server's members.
+  async listAllPlaylists() {
+    try {
+      const { data, error } = await this.supabase
+        .from("playlists")
+        .select("id, user_id, name, is_public, created_at, playlist_songs(id)")
+        .order("created_at", { ascending: true });
+
+      if (error) {
+        throw new Error(this.formatDatabaseError("list playlists", error));
+      }
+
+      return data.map(toPlaylistSummary);
     } catch (error) {
       throw new Error(this.formatDatabaseError("list playlists", error));
     }

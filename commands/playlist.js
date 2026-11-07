@@ -3,7 +3,7 @@ const { SlashCommandBuilder } = require("discord.js");
 const { createBaseEmbed, createErrorEmbed, createInfoEmbed, createSuccessEmbed } = require("../utils/embeds");
 const { createInteractionMessage } = require("../utils/interactionMessage");
 const { ensureMemberInVoice, ensureSameVoiceChannel } = require("../utils/validators");
-const { formatDuration, formatTrackLine, truncate } = require("../utils/formatters");
+const { escapeMarkdown, formatDuration, formatTrackLine, truncate } = require("../utils/formatters");
 const { mapWithConcurrency } = require("../utils/async");
 const { SPOTIFY_RESOLVE_CONCURRENCY } = require("../utils/constants");
 
@@ -80,11 +80,21 @@ module.exports = {
             .setDescription("Playlist name")
             .setRequired(true)
         )
+        .addUserOption((option) =>
+          option
+            .setName("owner")
+            .setDescription("Whose playlist to play (defaults to yours)")
+        )
     )
     .addSubcommand((subcommand) =>
       subcommand
         .setName("list")
         .setDescription("List your playlists.")
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("server")
+        .setDescription("List every playlist saved by members of this server.")
     )
     .addSubcommand((subcommand) =>
       subcommand
@@ -95,6 +105,11 @@ module.exports = {
             .setName("name")
             .setDescription("Playlist name")
             .setRequired(true)
+        )
+        .addUserOption((option) =>
+          option
+            .setName("owner")
+            .setDescription("Whose playlist to show (defaults to yours)")
         )
     ),
   async executePrefix({ client, message, args }) {
@@ -113,11 +128,14 @@ module.exports = {
         return handlePlay(client, message, args);
       case "list":
         return handleList(client, message);
+      case "server":
+      case "all":
+        return handleServer(client, message);
       case "info":
         return handleInfo(client, message, args);
       default:
         throw new Error(
-          "Usage: `,playlist <create|delete|add|remove|play|list|info> ...`\nTip: quote playlist names with spaces, for example `,playlist create \"Road Trip\"`."
+          "Usage: `,playlist <create|delete|add|remove|play|list|server|info> ...`\nTip: quote playlist names with spaces, for example `,playlist create \"Road Trip\"`."
         );
     }
   },
@@ -126,7 +144,7 @@ module.exports = {
     const subcommand = interaction.options.getSubcommand();
     const args = [subcommand];
 
-    if (subcommand === "list") {
+    if (subcommand === "list" || subcommand === "server") {
       return this.executePrefix({ client, message, args });
     }
 
@@ -143,9 +161,39 @@ module.exports = {
       args.push(String(interaction.options.getInteger("index", true)));
     }
 
+    // Passed as a trailing mention so slash and prefix commands share extractOwner().
+    const owner = interaction.options.getUser("owner");
+    if (owner) {
+      args.push(`<@${owner.id}>`);
+    }
+
     return this.executePrefix({ client, message, args });
   }
 };
+
+const MEMBER_FETCH_CHUNK_SIZE = 100;
+const EMBED_DESCRIPTION_LIMIT = 4096;
+
+// `,playlist play "Road Trip" @user` plays another member's playlist; without a trailing
+// mention the caller's own playlist is used.
+function extractOwner(args, message) {
+  const match = /^<@!?(\d+)>$/.exec(args[args.length - 1] || "");
+
+  if (!match) {
+    return message.author.id;
+  }
+
+  args.pop();
+  return match[1];
+}
+
+function playlistNotFoundError(ownerId, name, message) {
+  return new Error(
+    ownerId === message.author.id
+      ? `Playlist "${name}" was not found.`
+      : `<@${ownerId}> has no playlist named "${name}".`
+  );
+}
 
 async function handleCreate(client, message, args) {
   const name = args.join(" ").trim();
@@ -220,10 +268,11 @@ async function handleRemove(client, message, args) {
 }
 
 async function handlePlay(client, message, args) {
+  const ownerId = extractOwner(args, message);
   const name = args.join(" ").trim();
 
   if (!name) {
-    throw new Error("Usage: `,playlist play <name>`");
+    throw new Error("Usage: `,playlist play <name> [@owner]`");
   }
 
   const voiceChannel = await ensureMemberInVoice(message);
@@ -231,10 +280,10 @@ async function handlePlay(client, message, args) {
     return;
   }
 
-  const playlist = await client.playlists.getPlaylist(message.author.id, name);
+  const playlist = await client.playlists.getPlaylist(ownerId, name);
 
   if (!playlist) {
-    throw new Error(`Playlist "${name}" was not found.`);
+    throw playlistNotFoundError(ownerId, name, message);
   }
 
   if (playlist.songs.length === 0) {
@@ -309,18 +358,107 @@ async function handleList(client, message) {
   await message.reply({ embeds: [embed] });
 }
 
+async function handleServer(client, message) {
+  const playlists = await client.playlists.listAllPlaylists();
+  const ownerIds = [...new Set(playlists.map((playlist) => playlist.userId))];
+  const memberIds = await fetchMemberIds(message.guild, ownerIds);
+  const serverPlaylists = playlists.filter((playlist) => memberIds.has(playlist.userId));
+
+  if (!serverPlaylists.length) {
+    await message.reply({
+      embeds: [
+        createSuccessEmbed(
+          "No one in this server has saved a playlist yet. Create one with `,playlist create <name>`.",
+          "Server playlists"
+        )
+      ]
+    });
+    return;
+  }
+
+  const byOwner = new Map();
+  for (const playlist of serverPlaylists) {
+    if (!byOwner.has(playlist.userId)) {
+      byOwner.set(playlist.userId, []);
+    }
+    byOwner.get(playlist.userId).push(playlist);
+  }
+
+  const lines = [];
+  let length = 0;
+  let number = 0;
+  let shown = 0;
+
+  outer: for (const [ownerId, ownerPlaylists] of byOwner) {
+    // Mentions inside embeds render as names without pinging anyone.
+    const header = `${lines.length ? "\n" : ""}<@${ownerId}>`;
+    let headerAdded = false;
+
+    for (const playlist of ownerPlaylists) {
+      number += 1;
+      const line = `\`${String(number).padStart(2, "0")}.\` **${escapeMarkdown(truncate(playlist.name, 45))}** - ${playlist.songCount} song(s)`;
+      const needed = (headerAdded ? 0 : header.length + 1) + line.length + 1;
+
+      if (length + needed > EMBED_DESCRIPTION_LIMIT) {
+        break outer;
+      }
+
+      if (!headerAdded) {
+        lines.push(header);
+        length += header.length + 1;
+        headerAdded = true;
+      }
+
+      lines.push(line);
+      length += line.length + 1;
+      shown += 1;
+    }
+  }
+
+  const hidden = serverPlaylists.length - shown;
+  const embed = createBaseEmbed()
+    .setTitle(`Playlists in ${truncate(message.guild.name, 200)} (${serverPlaylists.length})`)
+    .setDescription(lines.join("\n"))
+    .setFooter({
+      text: `${hidden ? `${hidden} more not shown • ` : ""}Play one: /playlist play <name> owner:@user`
+    });
+
+  await message.reply({ embeds: [embed] });
+}
+
+// Fetching members by ID doesn't need the privileged GuildMembers intent. Discord takes
+// at most 100 IDs per request.
+async function fetchMemberIds(guild, userIds) {
+  const memberIds = new Set();
+
+  for (let i = 0; i < userIds.length; i += MEMBER_FETCH_CHUNK_SIZE) {
+    const members = await guild.members.fetch({ user: userIds.slice(i, i + MEMBER_FETCH_CHUNK_SIZE) });
+    for (const id of members.keys()) {
+      memberIds.add(id);
+    }
+  }
+
+  return memberIds;
+}
+
 async function handleInfo(client, message, args) {
+  const ownerId = extractOwner(args, message);
   const name = args.join(" ").trim();
 
   if (!name) {
-    throw new Error("Usage: `,playlist info <name>`");
+    throw new Error("Usage: `,playlist info <name> [@owner]`");
   }
 
-  const playlist = await client.playlists.getPlaylist(message.author.id, name);
+  const playlist = await client.playlists.getPlaylist(ownerId, name);
 
   if (!playlist) {
-    throw new Error(`Playlist "${name}" was not found.`);
+    throw playlistNotFoundError(ownerId, name, message);
   }
+
+  const ownerTag =
+    ownerId === message.author.id
+      ? message.author.tag
+      : (await client.users.fetch(ownerId).catch(() => null))?.tag || "Unknown";
 
   const totalDuration = playlist.songs.reduce((sum, song) => sum + song.duration, 0);
   const songPreview = playlist.songs.length
@@ -335,7 +473,7 @@ async function handleInfo(client, message, args) {
                 length: song.duration
               },
               requester: {
-                tag: message.author.tag
+                tag: ownerTag
               }
             },
             index + 1

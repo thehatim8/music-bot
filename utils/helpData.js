@@ -26,9 +26,10 @@ module.exports = [
       "`/playlist delete <name>` or `,playlist delete <name>`",
       "`/playlist add <name> <song>` or `,playlist add <name> <song>`",
       "`/playlist remove <name> <index>` or `,playlist remove <name> <index>`",
-      "`/playlist play <name>` or `,playlist play <name>`",
+      "`/playlist play <name> [owner]` or `,playlist play <name> [@owner]`",
       "`/playlist list` or `,playlist list`",
-      "`/playlist info <name>` or `,playlist info <name>`"
+      "`/playlist server` or `,playlist server`",
+      "`/playlist info <name> [owner]` or `,playlist info <name> [@owner]`"
     ]
   },
   {

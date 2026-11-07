@@ -86,11 +86,14 @@ Every music and playlist action now has both a slash command and a prefix comman
 - `,playlist delete <name>`
 - `,playlist add <name> <song>`
 - `,playlist remove <name> <index>`
-- `,playlist play <name>`
+- `,playlist play <name> [@owner]`
 - `,playlist list`
-- `,playlist info <name>`
+- `,playlist server` (every playlist saved by members of this server)
+- `,playlist info <name> [@owner]`
 
 Tip: quote playlist names with spaces, for example `,playlist create "Road Trip"` or `,playlist add "Road Trip" never gonna give you up`.
+
+Add `@owner` (or the `owner` option on the slash command) to play or view another member's playlist, for example `,playlist play "Road Trip" @sara`. Only the owner can add, remove, or delete songs.
 
 ## Supabase Setup
 
@@ -135,6 +138,10 @@ create table if not exists public.guild_settings (
 ```
 
 `guild_settings` is included so `/setprefix` persists across restarts.
+
+### Keep-alive
+
+Supabase pauses free-tier projects after 7 days without activity. The bot runs a tiny query against `playlists` when it starts and then every 24 hours (retrying hourly if it fails), and logs `Supabase keep-alive ping OK`. This only works while the bot is running. A project that's already paused has to be restored once from the Supabase dashboard.
 
 ## Lavalink Setup
 

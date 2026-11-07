@@ -5,6 +5,7 @@ const { loadCommands } = require("./handlers/commandHandler");
 const { loadEvents } = require("./handlers/eventHandler");
 const PlaylistRepository = require("./database/PlaylistRepository");
 const GuildSettingsRepository = require("./database/GuildSettingsRepository");
+const { startSupabaseKeepAlive } = require("./database/keepAlive");
 const PlayerManager = require("./music/PlayerManager");
 const MusicService = require("./music/MusicService");
 const config = require("./utils/config");
@@ -36,6 +37,7 @@ async function bootstrap() {
   client.config = config;
   client.guildSettings = new GuildSettingsRepository(config);
   client.playlists = new PlaylistRepository(config);
+  startSupabaseKeepAlive(client.playlists.supabase);
   client.playerManager = new PlayerManager(client, config);
   client.music = new MusicService(client);
   client.paths = {
