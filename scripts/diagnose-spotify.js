@@ -31,7 +31,16 @@ async function main() {
 
   await report("1. Playlist metadata", () => spotify.request(`/playlists/${parsed.id}?fields=name,public,collaborative,owner(display_name),tracks.total`));
 
-  await report("2. Tracks endpoint (what the bot now uses)", async () => {
+  await report("2. Embed page (where the bot now gets playlist songs)", async () => {
+    const entity = await spotify.fetchEmbedEntity("playlist", parsed.id);
+    return {
+      name: entity.name,
+      songsListed: Array.isArray(entity.trackList) ? entity.trackList.length : "trackList missing",
+      firstItems: (entity.trackList || []).slice(0, 5).map((item) => `${item.title} — ${item.subtitle}`)
+    };
+  });
+
+  await report("2b. Web API tracks endpoint (removed by Spotify in Feb 2026, expect 403)", async () => {
     const page = await spotify.request(`/playlists/${parsed.id}/tracks?limit=5&offset=0&additional_types=track`);
     return {
       total: page.total,

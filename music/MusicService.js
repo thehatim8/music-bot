@@ -706,7 +706,8 @@ class MusicService {
       source: "spotify",
       tracks,
       title: playlist.name,
-      skipped: playlist.tracks.length - tracks.length
+      skipped: playlist.tracks.length - tracks.length,
+      limited: Boolean(playlist.limited)
     };
   }
 

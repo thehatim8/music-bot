@@ -1,3 +1,14 @@
+// Spotify's public embed page (what Discord and websites use to show a playlist widget)
+// still lists a playlist's songs. The Web API stopped doing that for Development Mode
+// apps in Feb 2026: GET /playlists/{id}/tracks was removed, and its replacement /items
+// only returns songs for playlists the app's own user owns. The embed lists at most
+// the first 100 songs.
+const EMBED_BASE_URL = "https://open.spotify.com/embed";
+const EMBED_TRACK_LIMIT = 100;
+const EMBED_TIMEOUT_MS = 15000;
+const EMBED_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+
 class SpotifyService {
   constructor(config) {
     this.clientId = config.spotify.clientId;
@@ -110,8 +121,69 @@ class SpotifyService {
       throw new Error("That Spotify track URL is invalid.");
     }
 
-    const track = await this.request(`/tracks/${parsed.id}`);
-    return this.normalizeTrack(track);
+    try {
+      const track = await this.request(`/tracks/${parsed.id}`);
+      return this.normalizeTrack(track);
+    } catch (apiError) {
+      // The API refuses some requests (e.g. 403 when the app loses access); the embed
+      // page carries the same title, artists and length.
+      const entity = await this.fetchEmbedEntity("track", parsed.id).catch(() => null);
+
+      if (!entity?.name) {
+        throw apiError;
+      }
+
+      return this.normalizeEmbedTrack(entity, (entity.artists || []).map((artist) => artist.name));
+    }
+  }
+
+  // Returns the `entity` object from an embed page, or throws with status 404 when
+  // Spotify has no such (public) playlist/track.
+  async fetchEmbedEntity(type, id) {
+    const response = await fetch(`${EMBED_BASE_URL}/${type}/${id}`, {
+      headers: {
+        "User-Agent": EMBED_USER_AGENT,
+        "Accept-Language": "en"
+      },
+      signal: AbortSignal.timeout(EMBED_TIMEOUT_MS)
+    });
+
+    if (!response.ok) {
+      const error = new Error(`Spotify embed request failed (${response.status}).`);
+      error.status = response.status;
+      throw error;
+    }
+
+    const html = await response.text();
+    const match = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
+
+    if (!match) {
+      throw new Error("Spotify's embed page changed and the bot can no longer read it.");
+    }
+
+    const pageProps = JSON.parse(match[1])?.props?.pageProps;
+    const entity = pageProps?.state?.data?.entity;
+
+    if (!entity) {
+      const error = new Error(`Spotify embed has no ${type} ${id} (status ${pageProps?.status ?? "unknown"}).`);
+      error.status = 404;
+      throw error;
+    }
+
+    return entity;
+  }
+
+  normalizeEmbedTrack(entity, artistNames) {
+    const id = entity.id || String(entity.uri || "").split(":").pop() || null;
+    const track = {
+      name: entity.name || entity.title,
+      artists: artistNames.filter(Boolean).map((name) => ({ name })),
+      duration_ms: entity.duration,
+      external_urls: { spotify: id ? `https://open.spotify.com/track/${id}` : null },
+      album: { images: [{ url: entity.visualIdentity?.image?.[0]?.url || null }] }
+    };
+
+    return { ...this.normalizeTrack(track), id };
   }
 
   // Resolves a free-text query to the closest matching Spotify song. This is what
@@ -141,12 +213,12 @@ class SpotifyService {
       return error;
     }
 
-    // Spotify's Web API returns 404 for all Spotify-generated playlists
-    // (Liked Songs, Daily Mix, Discover Weekly, editorial lists) since the
-    // November 2024 API restrictions. Their IDs start with "37i9dQZF".
+    // Spotify-made playlists have IDs starting with "37i9dQZF". Editorial ones (Today's
+    // Top Hits, All Out 80s) load fine; personal mixes (Daily Mix, Discover Weekly)
+    // aren't shared with bots.
     if (playlistId.startsWith("37i9dQZF")) {
       return new Error(
-        "Spotify blocks bots from reading its auto-generated playlists (Liked Songs, Daily Mix, Discover Weekly, etc.). " +
+        "Spotify doesn't share personal mixes (Daily Mix, Discover Weekly, etc.) with bots. " +
           "Copy the songs into a regular playlist (select all → Add to playlist), make it public, and share that link instead."
       );
     }
@@ -154,63 +226,8 @@ class SpotifyService {
     return new Error("I couldn't find that Spotify playlist. It may be private or deleted — make it public and try again.");
   }
 
-  // Reads every page of a playlist's tracks. Deliberately does NOT use the `fields`
-  // filter: the filtered form of the playlist endpoint has been observed to return an
-  // empty `items` array for playlists the API otherwise serves fine. The unfiltered
-  // payload is larger but is the documented, reliable shape. `market` is also left off
-  // on purpose — with a market set, Spotify nulls out items unavailable there, which
-  // would silently drop tracks.
-  async getPlaylistTracks(playlistId) {
-    const tracks = [];
-    const dropped = { nullTrack: 0, local: 0, notASong: 0, unusable: 0 };
-    let itemsSeen = 0;
-    let total = null;
-    let next = `/playlists/${playlistId}/tracks?limit=100&offset=0&additional_types=track`;
-
-    while (next) {
-      const page = await this.request(next);
-      const items = Array.isArray(page.items) ? page.items : [];
-
-      if (typeof page.total === "number") {
-        total = page.total;
-      }
-
-      itemsSeen += items.length;
-
-      for (const item of items) {
-        const track = item?.track;
-
-        if (!track) {
-          // Spotify sends `null` for tracks it can't serve to this request
-          // (region-locked or removed from the catalogue).
-          dropped.nullTrack += 1;
-          continue;
-        }
-
-        if (track.is_local) {
-          dropped.local += 1;
-          continue;
-        }
-
-        if (track.type && track.type !== "track") {
-          dropped.notASong += 1;
-          continue;
-        }
-
-        if (!track.name) {
-          dropped.unusable += 1;
-          continue;
-        }
-
-        tracks.push(this.normalizeTrack(track));
-      }
-
-      next = page.next || null;
-    }
-
-    return { tracks, stats: { total, itemsSeen, dropped } };
-  }
-
+  // Region-locked songs are kept on purpose: the bot only needs their name and artists
+  // to find the audio elsewhere.
   async getPlaylist(url) {
     const parsed = this.parseSpotifyUrl(url);
 
@@ -218,28 +235,52 @@ class SpotifyService {
       throw new Error("That Spotify playlist URL is invalid.");
     }
 
-    let playlist;
+    let entity;
     try {
-      playlist = await this.request(`/playlists/${parsed.id}?fields=name,external_urls,tracks.total`);
+      entity = await this.fetchEmbedEntity("playlist", parsed.id);
     } catch (error) {
       throw this.translatePlaylistError(error, parsed.id);
     }
 
-    let result;
-    try {
-      result = await this.getPlaylistTracks(parsed.id);
-    } catch (error) {
-      throw this.translatePlaylistError(error, parsed.id);
+    const items = Array.isArray(entity.trackList) ? entity.trackList : [];
+    const tracks = [];
+    const dropped = { nullTrack: 0, local: 0, notASong: 0, unusable: 0 };
+
+    for (const item of items) {
+      if (!item) {
+        dropped.nullTrack += 1;
+        continue;
+      }
+
+      if (String(item.uri || "").startsWith("spotify:local:")) {
+        dropped.local += 1;
+        continue;
+      }
+
+      if (item.entityType && item.entityType !== "track") {
+        dropped.notASong += 1;
+        continue;
+      }
+
+      if (!item.title) {
+        dropped.unusable += 1;
+        continue;
+      }
+
+      // The embed gives artists as one comma-joined string. Splitting can cut a name
+      // like "Earth, Wind & Fire" in two, which still matches since any one artist
+      // name matching is enough.
+      const artistNames = String(item.subtitle || "").split(/,\s*/);
+      tracks.push(this.normalizeEmbedTrack({ ...item, name: item.title }, artistNames));
     }
 
     return {
-      name: playlist.name,
-      url: playlist.external_urls?.spotify || url,
-      tracks: result.tracks,
-      stats: {
-        ...result.stats,
-        total: result.stats.total ?? playlist.tracks?.total ?? null
-      }
+      name: entity.name || entity.title || "Spotify playlist",
+      url,
+      tracks,
+      // The embed stops at 100 songs, so a list of exactly 100 is probably cut short.
+      limited: items.length >= EMBED_TRACK_LIMIT,
+      stats: { total: items.length, itemsSeen: items.length, dropped }
     };
   }
 }

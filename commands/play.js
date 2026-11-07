@@ -4,6 +4,8 @@ const { createErrorEmbed, createInfoEmbed, createNowPlayingPayload, createShuffl
 const { createInteractionMessage } = require("../utils/interactionMessage");
 const { ensureMemberInVoice, ensureSameVoiceChannel } = require("../utils/validators");
 
+const SPOTIFY_LIMIT_NOTE = "\nSpotify only shares the first 100 songs of a playlist with bots, so any songs after that weren't loaded.";
+
 async function runPlay({ client, message, args }) {
   if (!args.length) {
     throw new Error("Usage: `,play <query or url>`");
@@ -66,7 +68,7 @@ async function runPlay({ client, message, args }) {
       await statusMessage.edit({
         embeds: [
           createSuccessEmbed(
-            `Queued **${result.tracks.length}** tracks from **${result.title}** in order.${result.skipped ? ` Skipped ${result.skipped} unresolved tracks.` : ""}`,
+            `Queued **${result.tracks.length}** tracks from **${result.title}** in order.${result.skipped ? ` Skipped ${result.skipped} unresolved tracks.` : ""}${result.limited ? SPOTIFY_LIMIT_NOTE : ""}`,
             "Playlist queued"
           )
         ],
@@ -100,7 +102,7 @@ async function runPlay({ client, message, args }) {
       await statusMessage.edit({
         embeds: [
           createSuccessEmbed(
-            `Queued **${result.tracks.length}** tracks from **${result.title}**.${result.skipped ? ` Skipped ${result.skipped} unresolved tracks.` : ""}`,
+            `Queued **${result.tracks.length}** tracks from **${result.title}**.${result.skipped ? ` Skipped ${result.skipped} unresolved tracks.` : ""}${result.limited ? SPOTIFY_LIMIT_NOTE : ""}`,
             "Playlist queued"
           )
         ],
