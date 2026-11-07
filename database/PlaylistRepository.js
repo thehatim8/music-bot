@@ -186,6 +186,37 @@ class PlaylistRepository {
     }
   }
 
+  // Creates the playlist and saves every song in one insert. If saving the songs fails,
+  // the new playlist is deleted again so no empty half-import is left behind.
+  async importPlaylist(userId, name, songs) {
+    const playlist = await this.createPlaylist(userId, name, false);
+
+    try {
+      const rows = songs.map((song, index) => ({
+        playlist_id: playlist.id,
+        title: song.title,
+        url: song.url,
+        duration: song.duration,
+        position: index + 1
+      }));
+      const { error } = await this.supabase.from("playlist_songs").insert(rows);
+
+      if (error) {
+        throw new Error(this.formatDatabaseError("import playlist", error));
+      }
+
+      return { ...playlist, songCount: rows.length };
+    } catch (error) {
+      try {
+        await this.supabase.from("playlists").delete().eq("id", playlist.id);
+      } catch {
+        // The import error below matters more than a failed cleanup.
+      }
+
+      throw new Error(this.formatDatabaseError("import playlist", error));
+    }
+  }
+
   async removeSong(userId, playlistName, index) {
     try {
       const playlist = await this.getPlaylist(userId, playlistName);

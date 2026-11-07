@@ -87,6 +87,7 @@ Every music and playlist action now has both a slash command and a prefix comman
 - `,playlist add <name> <song>`
 - `,playlist remove <name> <index>`
 - `,playlist play <name> [@owner]`
+- `,playlist import <spotify playlist link> [name]` (saves the first 100 songs; they're matched to audio when played)
 - `,playlist list`
 - `,playlist server` (every playlist saved by members of this server)
 - `,playlist info <name> [@owner]`

@@ -3,6 +3,8 @@ const AutoplayService = require("./AutoplayService");
 const { SPOTIFY_RESOLVE_BATCH_SIZE, SPOTIFY_RESOLVE_CONCURRENCY } = require("../utils/constants");
 const { mapWithConcurrency } = require("../utils/async");
 
+const STORED_ARTIST_SEPARATOR = " - ";
+
 const PROVIDER_LABELS = Object.freeze({
   ytdlp: "YouTube",
   ytmsearch: "YouTube Music",
@@ -380,11 +382,48 @@ class MusicService {
     return null;
   }
 
+  // Songs imported from Spotify are saved as "Artist, Artist - Title" with their Spotify
+  // link, and only matched to audio when the playlist is played.
+  spotifyTrackToStoredSong(track) {
+    const artists = (track.artists || []).map((artist) => artist.name).filter(Boolean).join(", ");
+    return {
+      title: artists ? `${artists}${STORED_ARTIST_SEPARATOR}${track.name}` : track.name,
+      url: track.url || "",
+      duration: track.duration || 0
+    };
+  }
+
+  storedSongToSpotifySong(song) {
+    const stored = String(song.title || "");
+    const index = stored.indexOf(STORED_ARTIST_SEPARATOR);
+
+    if (index === -1) {
+      return { title: stored, artists: [], durationMs: song.duration };
+    }
+
+    return {
+      title: stored.slice(index + STORED_ARTIST_SEPARATOR.length),
+      artists: stored.slice(0, index).split(/,\s*/).filter(Boolean),
+      durationMs: song.duration
+    };
+  }
+
   async resolveStoredTrack(song, requester) {
     const url = String(song.url || "");
     const isYouTubeUrl = /^(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\//i.test(url);
+    const isSpotifyUrl = this.spotify.parseSpotifyUrl(url)?.type === "track";
     const youtubeEnabled = this.providers.some((provider) => provider.prefix.startsWith("yt"));
     const storedVideoId = this.hasProvider("ytdlp") && isYouTubeUrl ? this.isYouTubeVideoUrl(url) : null;
+
+    if (isSpotifyUrl) {
+      const spotifySong = this.storedSongToSpotifySong(song);
+      const matched = await this.resolveMatchedAudio(spotifySong, requester, { sourceLabel: "Spotify" }).catch(() => null);
+
+      if (matched) {
+        matched.canonical = { title: spotifySong.title, artists: spotifySong.artists };
+        return matched;
+      }
+    }
 
     if (storedVideoId) {
       const track = await this.resolveYtdlpVideo(storedVideoId, requester).catch(() => null);
@@ -394,7 +433,8 @@ class MusicService {
     }
 
     try {
-      if (!url || (isYouTubeUrl && !youtubeEnabled)) {
+      // Lavalink can't load Spotify links, so those go straight to a text search.
+      if (!url || isSpotifyUrl || (isYouTubeUrl && !youtubeEnabled)) {
         throw new Error("Stored URL can't be loaded directly.");
       }
 

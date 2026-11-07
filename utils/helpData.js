@@ -27,6 +27,7 @@ module.exports = [
       "`/playlist add <name> <song>` or `,playlist add <name> <song>`",
       "`/playlist remove <name> <index>` or `,playlist remove <name> <index>`",
       "`/playlist play <name> [owner]` or `,playlist play <name> [@owner]`",
+      "`/playlist import <spotify link> [name]` or `,playlist import <spotify link> [name]`",
       "`/playlist list` or `,playlist list`",
       "`/playlist server` or `,playlist server`",
       "`/playlist info <name> [owner]` or `,playlist info <name> [@owner]`"
